@@ -1,21 +1,27 @@
-import '../globals.css';
-import type { Metadata } from 'next';
-import { ReactNode } from 'react';
+import "./globals.css";
+import ChatWidget from "@/components/ChatWidget";
 
-export const metadata: Metadata = {
-  title: 'RFP AI Agent',
-  description: 'Upload documents, chat with your knowledge base, and generate RFP reports.',
+export const metadata = {
+  title: "RFP AI Generator — Minimal UI",
+  description: "Upload a file and generate a DOCX report",
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body className="min-h-screen">
+      <body
+        style={{
+          margin: 0,
+          background: "#f8f9fa",
+          color: "#222",
+          fontFamily: "system-ui, sans-serif",
+          position: "relative",
+          minHeight: "100vh",
+        }}
+      >
         {children}
+        {/* 🟢 Collapsible floating chat widget */}
+        <ChatWidget />
       </body>
     </html>
   );

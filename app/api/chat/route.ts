@@ -1,38 +1,105 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { getEmbedding } from '../../../lib/openai';
-import { loadKb } from '../../../lib/kbStore';
+// app/api/chat/route.ts
+import { NextResponse } from "next/server";
+import OpenAI from "openai";
+import { getEmbedding } from "@/lib/embed";
+import { retrieveMatches } from "@/lib/kb";
 
+export const runtime = "nodejs"; // Needs node for Buffer/fs in kb.ts
+export const dynamic = "force-dynamic";
 
-export async function POST(request: NextRequest) {
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+async function fetchKB(): Promise<any[]> {
   try {
-    const body = await request.json();
-    const query = (body.query || '').toString().trim();
-    if (!query || query.length < 4) {
-      return NextResponse.json({ error: 'Query must be at least 4 characters' }, { status: 400 });
+    const res = await fetch(
+      "https://nwavns9phcxcbmyj.public.blob.vercel-storage.com/kb.json",
+      { cache: "no-store" }
+    );
+    if (!res.ok) throw new Error(`KB fetch failed: ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    console.error("KB_FETCH_ERROR", err);
+    return [];
+  }
+}
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json().catch(() => ({}));
+    const messages: ChatMessage[] = Array.isArray(body?.messages) ? body.messages : [];
+    const model: string =
+      typeof body?.model === "string" && body.model.trim()
+        ? body.model.trim()
+        : "gpt-4-turbo";
+
+    if (!messages.length) {
+      return NextResponse.json(
+        { error: "Send { messages: [{ role, content }, ...] }" },
+        { status: 400 }
+      );
     }
-    // Compute embedding for the query
-    const embedding = await getEmbedding(query);
-    // Load knowledge base
-    const kb = await loadKb();
-    // Compute similarity (dot product) between query embedding and each item
-    type Match = { question: string; answers: string[]; score: number };
-    const matches: Match[] = kb.map((item) => {
-      let score = 0;
-      // dot product
-      const minLength = Math.min(item.embedding.length, embedding.length);
-      for (let i = 0; i < minLength; i++) {
-        score += item.embedding[i] * embedding[i];
-      }
-      return { question: item.question, answers: item.answers, score };
+
+    const userMsg = messages[messages.length - 1]?.content || "";
+    if (!userMsg.trim()) {
+      return NextResponse.json({ error: "Empty user message" }, { status: 400 });
+    }
+
+    // 1️⃣ Embed user query
+    const embedding = await getEmbedding(userMsg);
+
+    // 2️⃣ Retrieve semantic matches from KB
+    const matches = await retrieveMatches(embedding, 5);
+    const context = matches
+      .map(
+        (m, i) =>
+          `Match ${i + 1}:\nQ: ${m.question}\nA: ${m.answer}`
+      )
+      .join("\n\n");
+
+    // 3️⃣ Build augmented prompt
+    const systemPrompt = `
+You are the Uprise RFP knowledge assistant. 
+Use the provided KB context to answer factually and concisely.
+If the KB doesn’t contain relevant info, say “I don’t have that information in the RFP knowledge base.”
+Always reference the KB context naturally in your reply when appropriate.
+`;
+
+    const chatMessages: ChatMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: `User query:\n${userMsg}\n\nRelevant context:\n${context}` },
+    ];
+
+    // 4️⃣ Generate KB-aware response
+    const completion = await openai.chat.completions.create({
+      model,
+      temperature: 0.3,
+      max_tokens: 600,
+      messages: chatMessages,
     });
-    // Sort descending by score and take top 5
-    const topMatches = matches
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5)
-      .map((m) => ({ question: m.question, answers: m.answers, score: m.score }));
-    return NextResponse.json({ matches: topMatches }, { status: 200 });
+
+    const reply = completion.choices?.[0]?.message?.content?.trim() ?? "";
+    const usage = completion.usage ?? undefined;
+
+    return NextResponse.json(
+      {
+        reply,
+        model,
+        contextMatches: matches.map((m) => ({
+          question: m.question,
+          score: m.score,
+          source: m.source || "kb.json",
+        })),
+        usage,
+      },
+      { status: 200 }
+    );
   } catch (err: any) {
-    console.error(err);
-    return NextResponse.json({ error: err.message || 'Internal error' }, { status: 500 });
+    console.error("CHAT_API_ERROR", err);
+    return NextResponse.json(
+      { error: err?.message || "Unexpected error" },
+      { status: 500 }
+    );
   }
 }

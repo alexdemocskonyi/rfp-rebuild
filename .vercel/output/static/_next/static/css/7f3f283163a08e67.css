@@ -1,0 +1,1 @@
+body,html{margin:0;padding:0;font-family:system-ui,sans-serif;background:#f8f9fa;color:#222}html{scroll-behavior:smooth}@keyframes pulse{0%{transform:scale(1);opacity:1}50%{transform:scale(1.08);opacity:.8}to{transform:scale(1);opacity:1}}.chat-pulse{animation:pulse 2s infinite}

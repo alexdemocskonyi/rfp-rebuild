@@ -1,0 +1,16 @@
+{
+  "projectId": "prj_1VEu0dcorFG716559CNrbCvN1P1x",
+  "orgId": "team_OPQteweg1frIvrkFYH3sDbZv",
+  "projectName": "rfp-ai",
+  "settings": {
+    "createdAt": 1762204820449,
+    "framework": "nextjs",
+    "devCommand": null,
+    "installCommand": null,
+    "buildCommand": null,
+    "outputDirectory": null,
+    "rootDirectory": null,
+    "directoryListing": false,
+    "nodeVersion": "22.x"
+  }
+}
