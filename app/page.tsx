@@ -7,29 +7,44 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
 
+  // Unified ingest helper
   async function ingestFile() {
     if (!file) {
       setStatus("Please select a file first.");
       return false;
     }
+
+    setStatus("📤 Uploading and ingesting file...");
     const formData = new FormData();
     formData.append("file", file);
-    setStatus("📤 Uploading and ingesting file...");
 
     try {
       const res = await fetch("/api/ingest", { method: "POST", body: formData });
       const json = await res.json();
-      if (json.ok) {
-        setStatus(`✅ Ingested ${json.total || "some"} entries into Knowledge Base.`);
-        return true;
+
+      // --- interpret response cleanly ---
+      if (!res.ok) {
+        setStatus(`❌ Ingest error: ${json.error || "Server failure"}`);
+        return false;
       }
-      if (json.skipped) {
-        setStatus(`⚠️ Skipped ingest — ${json.reason}`);
-        return true; // allow generation anyway
+
+        if (json.ok) {
+          if (json.skipped)
+            setStatus(`⚠️ ${json.reason || "No KB update, but ready to generate report."}`);
+          else
+            setStatus(`✅ Ingested ${json.total || "some"} entries into Knowledge Base.`);
+          return true; // always continue to report gen
+        }
+
+      if (json.reason) {
+        setStatus(`⚠️ ${json.reason}`);
+        return true; // allow report generation even if skipped
       }
-      throw new Error(json.error || "Unknown ingest failure");
+
+      setStatus(`❌ Ingest error: Unknown ingest failure`);
+      return false;
     } catch (err: any) {
-      setStatus(`❌ Ingest error: ${err.message}`);
+      setStatus(`❌ Ingest exception: ${err.message}`);
       return false;
     }
   }
@@ -41,6 +56,7 @@ export default function HomePage() {
     }
     setLoading(true);
     setStatus("⚙️ Ingesting before report generation…");
+
     const ok = await ingestFile();
     if (!ok) {
       setLoading(false);
@@ -54,12 +70,14 @@ export default function HomePage() {
       const res = await fetch("/api/generate-report", { method: "POST", body: form });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
+
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = `RFP_Report_${Date.now()}.docx`;
       a.click();
       URL.revokeObjectURL(url);
+
       setStatus("✅ Report generated successfully.");
     } catch (err: any) {
       setStatus(`❌ Report generation failed: ${err.message}`);
@@ -99,7 +117,14 @@ export default function HomePage() {
           }}
         />
 
-        <div style={{ display: "flex", gap: "10px", marginTop: "15px", justifyContent: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: "10px",
+            marginTop: "15px",
+            justifyContent: "center",
+          }}
+        >
           <button
             onClick={ingestFile}
             disabled={loading || !file}
@@ -141,9 +166,14 @@ export default function HomePage() {
               padding: "10px 20px",
               borderRadius: "6px",
               boxShadow: "0 1px 4px rgba(0,0,0,0.1)",
-              color: status.startsWith("❌") ? "red" : "#333",
+              color: status.startsWith("❌")
+                ? "red"
+                : status.startsWith("⚠️")
+                ? "#b58900"
+                : "green",
               minHeight: "50px",
               whiteSpace: "pre-line",
+              fontWeight: 500,
             }}
           >
             {status}

@@ -1,25 +1,28 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import React, { useEffect, useRef, useState } from "react";
+
+type Msg = { role: "user" | "assistant"; content: string };
 
 export default function ChatWidget() {
   const [open, setOpen] = useState(false);
-  const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
+  const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [saving, setSaving] = useState(false);
-  const messagesEnd = useRef<HTMLDivElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (messagesEnd.current) messagesEnd.current.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, open]);
 
   async function sendMessage(e: React.FormEvent) {
     e.preventDefault();
-    if (!input.trim() || busy) return;
+    const text = input.trim();
+    if (!text || busy) return;
 
-    const newMsgs = [...messages, { role: "user", content: input.trim() }];
-    setMessages(newMsgs);
+    const nextMsgs: Msg[] = [...messages, { role: "user", content: text }];
+    setMessages(nextMsgs);
     setInput("");
     setBusy(true);
 
@@ -27,12 +30,12 @@ export default function ChatWidget() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: newMsgs }),
+        body: JSON.stringify({ messages: nextMsgs }),
       });
       const data = await res.json();
-      const reply = data.reply || "No response.";
+      const reply: string = data?.reply ?? "No response.";
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
-    } catch (err) {
+    } catch {
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: "⚠️ Error: Unable to reach chat service." },
@@ -43,10 +46,20 @@ export default function ChatWidget() {
   }
 
   async function saveToKB() {
-    const lastUser = messages.findLast((m) => m.role === "user");
-    const lastAssistant = messages.findLast((m) => m.role === "assistant");
+    if (saving) return;
 
-    if (!lastUser || !lastAssistant) return alert("No Q&A pair to save.");
+    // Find last user/assistant pair (avoid .findLast for wider Node/TS support)
+    let lastUser: Msg | undefined;
+    let lastAssistant: Msg | undefined;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (!lastAssistant && messages[i].role === "assistant") lastAssistant = messages[i];
+      else if (!lastUser && messages[i].role === "user") lastUser = messages[i];
+      if (lastUser && lastAssistant) break;
+    }
+    if (!lastUser || !lastAssistant) {
+      alert("No Q&A pair to save.");
+      return;
+    }
 
     setSaving(true);
     try {
@@ -56,22 +69,23 @@ export default function ChatWidget() {
         body: JSON.stringify({
           question: lastUser.content,
           answer: lastAssistant.content,
+          source: "manual",
         }),
       });
       const data = await res.json();
-      if (data.ok) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: `✅ Added to Knowledge Base (total entries: ${data.count}).`,
-          },
-        ]);
-      } else throw new Error(data.error || "Save failed");
-    } catch (err: any) {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: `❌ Error saving: ${err.message}` },
+        {
+          role: "assistant",
+          content: data?.ok
+            ? "✅ Added to Knowledge Base."
+            : `❌ Save failed: ${data?.error || "Unknown error"}`,
+        },
+      ]);
+    } catch (e: any) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `❌ Save failed: ${e?.message || "Network error"}` },
       ]);
     } finally {
       setSaving(false);
@@ -80,34 +94,27 @@ export default function ChatWidget() {
 
   return (
     <>
-      {/* Floating Chat Toggle Button */}
+      {/* Floating Toggle */}
       <button
-        onClick={() => setOpen(!open)}
-        className="fixed bottom-6 right-6 bg-blue-600 hover:bg-blue-700 text-white rounded-full shadow-lg w-14 h-14 flex items-center justify-center text-2xl transition-all z-[9999]"
-        style={{
-          fontWeight: "bold",
-          position: "fixed",
-        }}
+        onClick={() => setOpen((v) => !v)}
+        className="fixed bottom-6 right-6 bg-blue-600 hover:bg-blue-700 text-white rounded-full shadow-lg w-14 h-14 flex items-center justify-center text-2xl z-[9999]"
         title={open ? "Close chat" : "Chat with Uprise Assistant"}
+        aria-label="Chat"
+        type="button"
       >
         💬
       </button>
 
-      {/* Chat Window */}
       {open && (
-        <div
-          className="fixed bottom-[90px] right-6 z-[9999] w-[360px] sm:w-[380px] bg-white border border-gray-200 rounded-xl shadow-2xl flex flex-col overflow-hidden"
-          style={{
-            maxHeight: "70vh",
-            position: "fixed",
-          }}
-        >
+        <div className="fixed bottom-[90px] right-6 z-[9999] w-[360px] sm:w-[380px] bg-white border border-gray-200 rounded-xl shadow-2xl flex flex-col overflow-hidden">
           {/* Header */}
           <div className="flex items-center justify-between bg-blue-600 text-white px-4 py-2">
             <h2 className="text-sm font-semibold">Uprise Chat Assistant</h2>
             <button
               onClick={() => setOpen(false)}
               className="text-white hover:text-gray-100 text-xl leading-none"
+              aria-label="Close chat"
+              type="button"
             >
               ×
             </button>
@@ -132,15 +139,16 @@ export default function ChatWidget() {
                 {m.content}
               </div>
             ))}
-            <div ref={messagesEnd} />
+            <div ref={messagesEndRef} />
           </div>
 
-          {/* Save to KB Button */}
+          {/* Save-to-KB */}
           {messages.some((m) => m.role === "assistant") && (
             <button
               onClick={saveToKB}
               disabled={saving}
               className="mx-3 mb-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg py-1.5 px-3 transition disabled:opacity-50"
+              type="button"
             >
               {saving ? "Saving..." : "💾 Save to Knowledge Base"}
             </button>

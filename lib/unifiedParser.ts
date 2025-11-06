@@ -1,183 +1,167 @@
-// lib/unifiedParser.ts
+import { parse } from "csv-parse/sync";
 import * as XLSX from "xlsx";
 import mammoth from "mammoth";
+import pdfParse from "pdf-parse";
+import OpenAI from "openai";
 
-type Q = { question: string; answer?: string };
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-const HEADER_MATCH = /(question|prompt|question\/prompt|rfp\s*item|inquiry|ask)/i;
+export type QAPair = {
+  question: string;
+  answer: string;
+  source?: string;
+};
 
-function norm(s: string) {
-  return s.replace(/\s+/g, " ").trim();
+const Q_HEADER_REGEX = /(question|prompt|rfp\s*item|inquiry|ask)/i;
+const A_HEADER_REGEX = /(answer|response|reply|details|description|explanation)/i;
+
+function norm(s: any) {
+  return (s ?? "").toString().replace(/\s+/g, " ").trim();
 }
 
-function dedupe(questions: Q[]): Q[] {
+function dedupe(pairs: QAPair[]): QAPair[] {
   const seen = new Set<string>();
-  const out: Q[] = [];
-  for (const q of questions) {
-    const k = norm(q.question).toLowerCase();
+  const out: QAPair[] = [];
+  for (const p of pairs) {
+    const k = norm(p.question).toLowerCase();
     if (!k || seen.has(k)) continue;
     seen.add(k);
-    out.push({ question: norm(q.question) });
+    out.push({ question: norm(p.question), answer: norm(p.answer), source: p.source });
   }
   return out;
 }
 
-function extractQuestionsFromText(text: string): string[] {
-  const questions: string[] = [];
-  if (!text) return questions;
-  // Grab any sentence containing a question mark
-  const matches = text.match(/[^.!?\n\r]*\?+[^.!?\n\r]*/g);
-  if (matches) {
-    for (const m of matches) {
-      const q = norm(m);
-      if (q.length > 3 && q.includes("?")) questions.push(q);
-    }
-  }
-  return questions;
-}
+/* -------------------------------------------------------------------------- */
+/* CSV + XLSX (now supports Q-only rows) */
+/* -------------------------------------------------------------------------- */
 
-function fromCSV(buf: Buffer): Q[] {
+function extractPairsFromCSV(buf: Buffer, source: string): QAPair[] {
   const text = buf.toString("utf8");
-  const lines = text.split(/\r?\n/).filter(l => l.trim().length);
-  if (!lines.length) return [];
+  const delimiter = text.includes("\t") ? "\t" : ",";
+  const records = parse(text, {
+    columns: true,
+    skip_empty_lines: true,
+    relax_quotes: true,
+    delimiter,
+  });
 
-  // Simple CSV split (handles quoted cells)
-  const parseLine = (line: string) =>
-    (line.match(/(".*?"|[^",]+)(?=\s*,|\s*$)/g) || []).map(s => s.replace(/^"|"$/g, ""));
+  const pairs: QAPair[] = [];
+  for (const row of records) {
+    const keys = Object.keys(row);
+    if (!keys.length) continue;
 
-  const headerCells = parseLine(lines[0]).map(norm);
-  let body = lines;
-  let headerColIdx: number | null = null;
+    const qKey = keys.find((k) => Q_HEADER_REGEX.test(k)) ?? keys[0];
+    const aKey = keys.find((k) => A_HEADER_REGEX.test(k)) ?? keys[1];
+    const q = norm(row[qKey]);
+    const a = norm(aKey ? row[aKey] : "");
 
-  // Detect a header column containing question/prompt
-  for (let i = 0; i < Math.min(3, lines.length); i++) {
-    const cells = parseLine(lines[i]).map(norm);
-    const idx = cells.findIndex(c => HEADER_MATCH.test(c));
-    if (idx >= 0) {
-      headerColIdx = idx;
-      body = lines.slice(i + 1);
-      break;
-    }
+    if (q) pairs.push({ question: q, answer: a || "", source });
   }
 
-  const out: Q[] = [];
-  for (const line of body) {
-    const cells = parseLine(line).map(norm);
-    if (headerColIdx != null) {
-      const v = cells[headerColIdx] || "";
-      if (v) out.push({ question: v });
-    } else {
-      // Fallback: flatten row; prefer ?-sentences; otherwise take first non-empty cell
-      const flat = cells.join(" ").trim();
-      const qs = extractQuestionsFromText(flat);
-      if (qs.length) qs.forEach(q => out.push({ question: q }));
-      else if (cells[0]) out.push({ question: cells[0] });
-    }
-  }
-  return dedupe(out);
+  console.log(`[PARSER] CSV extracted ${pairs.length} total rows (Q/A or Q-only)`);
+  return dedupe(pairs);
 }
 
-function fromXLSX(buf: Buffer, filename: string): Q[] {
+function extractPairsFromXLSX(buf: Buffer, source: string): QAPair[] {
   const wb = XLSX.read(buf, { type: "buffer" });
-  const all: Q[] = [];
+  const all: QAPair[] = [];
 
   for (const sheetName of wb.SheetNames) {
     const sheet = wb.Sheets[sheetName];
+    const json = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, { defval: "" });
+    for (const row of json) {
+      const keys = Object.keys(row);
+      if (!keys.length) continue;
 
-    // 1) Try header-aware extraction using header:1 for raw matrix
-    const grid: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
-    let extracted: Q[] = [];
-
-    if (Array.isArray(grid) && grid.length) {
-      // Search first 5 rows for a column header that matches question/prompt
-      let headerRow = 0, headerCol: number | null = null;
-      for (let r = 0; r < Math.min(5, grid.length); r++) {
-        const row = grid[r].map((v: any) => String(v ?? ""));
-        const idx = row.findIndex((cell: string) => HEADER_MATCH.test(cell));
-        if (idx >= 0) { headerRow = r; headerCol = idx; break; }
-      }
-
-      if (headerCol != null) {
-        for (let r = headerRow + 1; r < grid.length; r++) {
-          const cell = String(grid[r]?.[headerCol] ?? "").trim();
-          if (cell) extracted.push({ question: cell });
-        }
-      } else {
-        // 2) No obvious header — flatten each row and extract ?-sentences,
-        //     or take the first non-empty cell as a prompt-like line.
-        for (let r = 0; r < grid.length; r++) {
-          const row = grid[r].map((v: any) => String(v ?? ""));
-          const flat = norm(row.join(" "));
-          if (!flat) continue;
-          const qs = extractQuestionsFromText(flat);
-          if (qs.length) qs.forEach(q => extracted.push({ question: q }));
-          else if (row[0]) extracted.push({ question: row[0] });
-        }
-      }
-    } else {
-      // 3) Ultimate fallback using sheet_to_json objects
-      const rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, { defval: "" });
-      for (const r of rows) {
-        const values = Object.values(r).map(v => String(v ?? "")).filter(Boolean);
-        const flat = norm(values.join(" "));
-        if (!flat) continue;
-        const qs = extractQuestionsFromText(flat);
-        if (qs.length) qs.forEach(q => extracted.push({ question: q }));
-        else if (values[0]) extracted.push({ question: values[0] });
-      }
+      const qKey = keys.find((k) => Q_HEADER_REGEX.test(k)) ?? keys[0];
+      const aKey = keys.find((k) => A_HEADER_REGEX.test(k)) ?? keys[1];
+      const q = norm(row[qKey]);
+      const a = norm(aKey ? row[aKey] : "");
+      if (q) all.push({ question: q, answer: a || "", source });
     }
-
-    const deduped = dedupe(extracted);
-    console.log(`[PARSER] Sheet '${sheetName}' — ${deduped.length} questions detected`);
-    all.push(...deduped);
   }
 
-  const final = dedupe(all);
-  console.log(`[PARSER] Total: ${final.length} questions extracted from ${filename}`);
-  return final;
+  console.log(`[PARSER] XLSX extracted ${all.length} total rows (Q/A or Q-only)`);
+  return dedupe(all);
 }
 
-async function fromDOCX(buf: Buffer): Promise<Q[]> {
+/* -------------------------------------------------------------------------- */
+/* DOCX + TXT + PDF */
+/* -------------------------------------------------------------------------- */
+
+async function extractFromDOCX(buf: Buffer, source: string): Promise<QAPair[]> {
   const res = await mammoth.extractRawText({ buffer: buf });
-  const qs = extractQuestionsFromText(res.value);
-  if (qs.length) return dedupe(qs.map(q => ({ question: q })));
-
-  // If no '?' sentences, treat each non-empty line as a prompt-like item
   const lines = res.value.split(/\r?\n+/).map(norm).filter(Boolean);
-  return dedupe(lines.map(l => ({ question: l })));
+  const pairs: QAPair[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].endsWith("?")) {
+      pairs.push({ question: lines[i], answer: lines[i + 1] || "", source });
+    }
+  }
+
+  console.log(`[PARSER] DOCX extracted ${pairs.length} Q/A or Q-only`);
+  return dedupe(pairs);
 }
 
-function fromTXT(buf: Buffer): Q[] {
-  const text = buf.toString("utf8");
-  const qs = extractQuestionsFromText(text);
-  if (qs.length) return dedupe(qs.map(q => ({ question: q })));
+function extractFromTXT(buf: Buffer, source: string): QAPair[] {
+  const lines = buf.toString("utf8").split(/\r?\n+/).map(norm).filter(Boolean);
+  const pairs: QAPair[] = [];
 
-  const lines = text.split(/\r?\n+/).map(norm).filter(Boolean);
-  return dedupe(lines.map(l => ({ question: l })));
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].endsWith("?")) {
+      pairs.push({ question: lines[i], answer: lines[i + 1] || "", source });
+    }
+  }
+
+  console.log(`[PARSER] TXT extracted ${pairs.length} Q/A or Q-only`);
+  return dedupe(pairs);
 }
 
-export async function parseUnified(buf: Buffer, filename: string): Promise<Q[]> {
-  const lower = (filename || "").toLowerCase();
-
+async function extractFromPDF(buf: Buffer, source: string): Promise<QAPair[]> {
   try {
-    if (lower.endsWith(".xlsx") || lower.endsWith(".xlsm") || lower.endsWith(".xls")) {
-      return fromXLSX(buf, filename);
+    const data = await pdfParse(buf);
+    const text = norm(data.text);
+    if (text.length < 200) {
+      console.warn("[PARSER] PDF text too short — using fallback");
+      return extractQuestionsFromText(text, source);
     }
-    if (lower.endsWith(".csv")) {
-      return fromCSV(buf);
-    }
-    if (lower.endsWith(".docx")) {
-      return fromDOCX(buf);
-    }
-    if (lower.endsWith(".txt") || lower.endsWith(".md")) {
-      return fromTXT(buf);
-    }
+    return extractQuestionsFromText(text, source);
+  } catch (err) {
+    console.error("[PDF_PARSE_ERROR]", err);
+    return [];
+  }
+}
 
-    // Unknown: try text fallback
-    return fromTXT(buf);
+function extractQuestionsFromText(text: string, source: string): QAPair[] {
+  const lines = text.split(/\r?\n+/).map(norm).filter(Boolean);
+  const out: QAPair[] = [];
+  for (const line of lines) {
+    if (/\?$/.test(line) && line.length > 5) {
+      out.push({ question: line, answer: "", source });
+    }
+  }
+  console.log(`[PARSER] Fallback text question-only extraction: ${out.length}`);
+  return dedupe(out);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Main entry */
+/* -------------------------------------------------------------------------- */
+
+export async function parseUnified(buf: Buffer, filename: string): Promise<QAPair[]> {
+  const lower = (filename || "").toLowerCase();
+  const source = filename.replace(/\.[^.]+$/, "");
+  try {
+    if (lower.endsWith(".csv")) return extractPairsFromCSV(buf, source);
+    if (/\.(xlsx|xlsm|xls)$/i.test(lower)) return extractPairsFromXLSX(buf, source);
+    if (lower.endsWith(".docx")) return await extractFromDOCX(buf, source);
+    if (lower.endsWith(".pdf")) return await extractFromPDF(buf, source);
+    if (/\.(txt|md)$/i.test(lower)) return extractFromTXT(buf, source);
+
+    return extractQuestionsFromText(buf.toString("utf8"), source);
   } catch (err) {
     console.error("[PARSER_ERROR]", err);
-    // Last-ditch: try text fallback so we return something
-    return fromTXT(buf);
+    return [];
   }
 }
