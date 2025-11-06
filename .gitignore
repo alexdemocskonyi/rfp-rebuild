@@ -1,2 +1,20 @@
-node_modules
-node_modules
+# Node / build
+node_modules/
+.next/
+out/
+standalone/
+backups/
+*.tar.gz
+*.zip
+
+# Local env (keep examples only)
+.env*
+!.env.example
+
+# Generated artifacts
+*.docx
+*.csv
+*.xlsx
+
+# System junk
+.DS_Store
