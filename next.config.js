@@ -1,11 +1,7 @@
-/** @type {import("next").NextConfig} */
+/** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // ✅ Enable Node.js runtime for API routes
   output: "standalone",
-  experimental: {
-    appDir: true, // ensures the new App Router is active
-  },
   eslint: {
     ignoreDuringBuilds: true,
   },
@@ -14,4 +10,4 @@ const nextConfig = {
   },
 };
 
-module.exports = nextConfig;
+export default nextConfig;
