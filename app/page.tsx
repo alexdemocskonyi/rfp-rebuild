@@ -1,6 +1,27 @@
 "use client";
+
 import { useState } from "react";
 import ChatWidget from "@/components/ChatWidget";
+import {
+  Document,
+  Packer,
+  Paragraph,
+  HeadingLevel,
+  TextRun,
+} from "docx";
+
+type MatchItem = {
+  source: string;
+  snippet: string;
+};
+
+type QAItem = {
+  question: string;
+  aiAnswer: string;
+  sourcesUsed?: string[];
+  contextualMatches?: MatchItem[];
+  rawTextMatches?: MatchItem[];
+};
 
 export default function HomePage() {
   const [file, setFile] = useState<File | null>(null);
@@ -19,29 +40,36 @@ export default function HomePage() {
     formData.append("file", file);
 
     try {
-      const res = await fetch("/api/ingest", { method: "POST", body: formData });
+      const res = await fetch("/api/ingest", {
+        method: "POST",
+        body: formData,
+      });
       const json = await res.json();
 
-      // --- interpret response cleanly ---
       if (!res.ok) {
         setStatus(`❌ Ingest error: ${json.error || "Server failure"}`);
         return false;
       }
 
-        if (json.ok) {
-          if (json.skipped)
-            setStatus(`⚠️ ${json.reason || "No KB update, but ready to generate report."}`);
-          else
-            setStatus(`✅ Ingested ${json.total || "some"} entries into Knowledge Base.`);
-          return true; // always continue to report gen
+      if (json.ok) {
+        if (json.skipped) {
+          setStatus(
+            `⚠️ ${json.reason || "No KB update, but ready to generate report."}`
+          );
+        } else {
+          setStatus(
+            `✅ Ingested ${json.total || "some"} entries into Knowledge Base.`
+          );
         }
+        return true;
+      }
 
       if (json.reason) {
         setStatus(`⚠️ ${json.reason}`);
-        return true; // allow report generation even if skipped
+        return true;
       }
 
-      setStatus(`❌ Ingest error: Unknown ingest failure`);
+      setStatus("❌ Ingest error: Unknown ingest failure");
       return false;
     } catch (err: any) {
       setStatus(`❌ Ingest exception: ${err.message}`);
@@ -54,6 +82,7 @@ export default function HomePage() {
       setStatus("Please select a file first.");
       return;
     }
+
     setLoading(true);
     setStatus("⚙️ Ingesting before report generation…");
 
@@ -63,14 +92,136 @@ export default function HomePage() {
       return;
     }
 
-    setStatus("🧠 Generating RFP Report...");
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const res = await fetch("/api/generate-report", { method: "POST", body: form });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
+      setStatus("🧠 Generating RFP report (this may take a few minutes)…");
 
+      const allItems: QAItem[] = [];
+      let batch = 0;
+      let totalQuestions = 0;
+
+      // 🔁 Loop over server-side batches until done
+      while (true) {
+        const form = new FormData();
+        form.append("file", file);
+        form.append("batch", String(batch));
+
+        const res = await fetch("/api/generate-report", {
+          method: "POST",
+          body: form,
+        });
+
+        const json = await res.json();
+
+        if (!res.ok || !json.ok) {
+          const msg = json?.error || `HTTP ${res.status}`;
+          throw new Error(msg);
+        }
+
+        const items: QAItem[] = json.items || [];
+        totalQuestions = json.totalQuestions || totalQuestions;
+
+        allItems.push(...items);
+
+        const done: boolean = !!json.done;
+        setStatus(
+          `🧠 Generating RFP report… (${allItems.length}/${totalQuestions} questions processed)`
+        );
+
+        if (done) break;
+        batch += 1;
+      }
+
+      // --- Build one DOCX on the client ---
+      const paras: Paragraph[] = [];
+
+      allItems.forEach((item, idx) => {
+        // Question heading
+        paras.push(
+          new Paragraph({
+            text: `Question ${idx + 1}: ${item.question}`,
+            heading: HeadingLevel.HEADING_2,
+          })
+        );
+
+        // AI Answer
+        paras.push(
+          new Paragraph({
+            children: [
+              new TextRun({ text: "Answer:\n", bold: true }),
+              new TextRun(item.aiAnswer || "Information not found in KB."),
+            ],
+          })
+        );
+
+        // Sources used
+        if (item.sourcesUsed && item.sourcesUsed.length > 0) {
+          paras.push(
+            new Paragraph({
+              children: [
+                new TextRun({ text: "Sources used: ", bold: true }),
+                new TextRun(item.sourcesUsed.join("; ")),
+              ],
+            })
+          );
+        }
+
+        // Top contextual matches (KB answers)
+        if (item.contextualMatches && item.contextualMatches.length > 0) {
+          paras.push(
+            new Paragraph({
+              children: [new TextRun({ text: "Top contextual matches:", bold: true })],
+            })
+          );
+
+          item.contextualMatches.forEach((m) => {
+            paras.push(
+              new Paragraph({
+                bullet: { level: 0 },
+                children: [
+                  new TextRun({
+                    text: `[${m.source}] `,
+                    bold: true,
+                  }),
+                  new TextRun(m.snippet),
+                ],
+              })
+            );
+          });
+        }
+
+        // Top raw-text matches
+        if (item.rawTextMatches && item.rawTextMatches.length > 0) {
+          paras.push(
+            new Paragraph({
+              children: [new TextRun({ text: "Top raw-text matches:", bold: true })],
+            })
+          );
+
+          item.rawTextMatches.forEach((m) => {
+            paras.push(
+              new Paragraph({
+                bullet: { level: 0 },
+                children: [
+                  new TextRun({
+                    text: `[${m.source}] `,
+                    bold: true,
+                  }),
+                  new TextRun(m.snippet),
+                ],
+              })
+            );
+          });
+        }
+
+        // Spacer
+        paras.push(new Paragraph({ text: "" }));
+      });
+
+      const doc = new Document({
+        sections: [{ children: paras }],
+      });
+
+      const blob = await Packer.toBlob(doc);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -80,7 +231,10 @@ export default function HomePage() {
 
       setStatus("✅ Report generated successfully.");
     } catch (err: any) {
-      setStatus(`❌ Report generation failed: ${err.message}`);
+      console.error("Report generation failed", err);
+      setStatus(
+        `❌ Report generation failed: ${err.message || "Unknown error"}`
+      );
     } finally {
       setLoading(false);
     }
@@ -100,9 +254,12 @@ export default function HomePage() {
       }}
     >
       <div style={{ maxWidth: 420, textAlign: "center" }}>
-        <h1 style={{ fontSize: "1.8rem", fontWeight: 700 }}>📄 UPRISE RFP Tool</h1>
+        <h1 style={{ fontSize: "1.8rem", fontWeight: 700 }}>
+          📄 UPRISE RFP Tool
+        </h1>
         <p style={{ color: "#555", marginBottom: "1rem" }}>
-          Upload a document — we’ll ingest it automatically before generating your report.
+          Upload a document — we’ll ingest it automatically before generating
+          your report.
         </p>
 
         <input
