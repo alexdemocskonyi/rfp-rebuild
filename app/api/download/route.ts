@@ -1,11 +1,11 @@
+export const runtime = "nodejs";
+
 import { NextResponse } from "next/server";
 import fs from "fs/promises";
-
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const filePath = searchParams.get("path");
   if (!filePath) return NextResponse.json({ error: "Missing path" }, { status: 400 });
-
   try {
     const buffer = await fs.readFile(filePath);
     return new NextResponse(buffer, {

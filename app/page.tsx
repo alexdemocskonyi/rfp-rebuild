@@ -2,77 +2,48 @@
 
 import { useState } from "react";
 import ChatWidget from "@/components/ChatWidget";
-import {
-  Document,
-  Packer,
-  Paragraph,
-  HeadingLevel,
-  TextRun,
-} from "docx";
 
-type MatchItem = {
-  source: string;
-  snippet: string;
-};
-
-type QAItem = {
-  question: string;
-  aiAnswer: string;
-  sourcesUsed?: string[];
-  contextualMatches?: MatchItem[];
-  rawTextMatches?: MatchItem[];
-};
+// Download helper
+function downloadZip(payload: any) {
+  if (!payload || !payload.data) return;
+  const bytes = Uint8Array.from(atob(payload.data), (c) => c.charCodeAt(0));
+  const blob = new Blob([bytes], { type: payload.mime || "application/zip" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = payload.filename || "reports.zip";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export default function HomePage() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState<string | null>(null);
+  const [status, setStatus] = useState("");
 
-  // Unified ingest helper
   async function ingestFile() {
     if (!file) {
       setStatus("Please select a file first.");
       return false;
     }
 
-    setStatus("📤 Uploading and ingesting file...");
-    const formData = new FormData();
-    formData.append("file", file);
+    setStatus("📤 Uploading & ingesting file…");
+    const form = new FormData();
+    form.append("file", file);
 
     try {
-      const res = await fetch("/api/ingest", {
-        method: "POST",
-        body: formData,
-      });
+      const res = await fetch("/api/ingest", { method: "POST", body: form });
       const json = await res.json();
 
-      if (!res.ok) {
-        setStatus(`❌ Ingest error: ${json.error || "Server failure"}`);
+      if (!json.ok) {
+        setStatus(`⚠️ ${json.error || json.reason}`);
         return false;
       }
 
-      if (json.ok) {
-        if (json.skipped) {
-          setStatus(
-            `⚠️ ${json.reason || "No KB update, but ready to generate report."}`
-          );
-        } else {
-          setStatus(
-            `✅ Ingested ${json.total || "some"} entries into Knowledge Base.`
-          );
-        }
-        return true;
-      }
-
-      if (json.reason) {
-        setStatus(`⚠️ ${json.reason}`);
-        return true;
-      }
-
-      setStatus("❌ Ingest error: Unknown ingest failure");
-      return false;
+      setStatus("✅ File ingested successfully.");
+      return true;
     } catch (err: any) {
-      setStatus(`❌ Ingest exception: ${err.message}`);
+      setStatus(`❌ Ingest failed: ${err.message}`);
       return false;
     }
   }
@@ -84,157 +55,35 @@ export default function HomePage() {
     }
 
     setLoading(true);
-    setStatus("⚙️ Ingesting before report generation…");
+    setStatus("⚙️ Ingesting…");
 
-    const ok = await ingestFile();
-    if (!ok) {
+    if (!(await ingestFile())) {
       setLoading(false);
       return;
     }
 
     try {
-      setStatus("🧠 Generating RFP report (this may take a few minutes)…");
+      setStatus("🧠 Generating all report formats…");
 
-      const allItems: QAItem[] = [];
-      let batch = 0;
-      let totalQuestions = 0;
+      const form = new FormData();
+      form.append("file", file);
 
-      // 🔁 Loop over server-side batches until done
-      while (true) {
-        const form = new FormData();
-        form.append("file", file);
-        form.append("batch", String(batch));
-
-        const res = await fetch("/api/generate-report", {
-          method: "POST",
-          body: form,
-        });
-
-        const json = await res.json();
-
-        if (!res.ok || !json.ok) {
-          const msg = json?.error || `HTTP ${res.status}`;
-          throw new Error(msg);
-        }
-
-        const items: QAItem[] = json.items || [];
-        totalQuestions = json.totalQuestions || totalQuestions;
-
-        allItems.push(...items);
-
-        const done: boolean = !!json.done;
-        setStatus(
-          `🧠 Generating RFP report… (${allItems.length}/${totalQuestions} questions processed)`
-        );
-
-        if (done) break;
-        batch += 1;
-      }
-
-      // --- Build one DOCX on the client ---
-      const paras: Paragraph[] = [];
-
-      allItems.forEach((item, idx) => {
-        // Question heading
-        paras.push(
-          new Paragraph({
-            text: `Question ${idx + 1}: ${item.question}`,
-            heading: HeadingLevel.HEADING_2,
-          })
-        );
-
-        // AI Answer
-        paras.push(
-          new Paragraph({
-            children: [
-              new TextRun({ text: "Answer:\n", bold: true }),
-              new TextRun(item.aiAnswer || "Information not found in KB."),
-            ],
-          })
-        );
-
-        // Sources used
-        if (item.sourcesUsed && item.sourcesUsed.length > 0) {
-          paras.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: "Sources used: ", bold: true }),
-                new TextRun(item.sourcesUsed.join("; ")),
-              ],
-            })
-          );
-        }
-
-        // Top contextual matches (KB answers)
-        if (item.contextualMatches && item.contextualMatches.length > 0) {
-          paras.push(
-            new Paragraph({
-              children: [new TextRun({ text: "Top contextual matches:", bold: true })],
-            })
-          );
-
-          item.contextualMatches.forEach((m) => {
-            paras.push(
-              new Paragraph({
-                bullet: { level: 0 },
-                children: [
-                  new TextRun({
-                    text: `[${m.source}] `,
-                    bold: true,
-                  }),
-                  new TextRun(m.snippet),
-                ],
-              })
-            );
-          });
-        }
-
-        // Top raw-text matches
-        if (item.rawTextMatches && item.rawTextMatches.length > 0) {
-          paras.push(
-            new Paragraph({
-              children: [new TextRun({ text: "Top raw-text matches:", bold: true })],
-            })
-          );
-
-          item.rawTextMatches.forEach((m) => {
-            paras.push(
-              new Paragraph({
-                bullet: { level: 0 },
-                children: [
-                  new TextRun({
-                    text: `[${m.source}] `,
-                    bold: true,
-                  }),
-                  new TextRun(m.snippet),
-                ],
-              })
-            );
-          });
-        }
-
-        // Spacer
-        paras.push(new Paragraph({ text: "" }));
+      const res = await fetch("/api/generate-report", {
+        method: "POST",
+        body: form,
       });
 
-      const doc = new Document({
-        sections: [{ children: paras }],
-      });
+      const json = await res.json();
 
-      const blob = await Packer.toBlob(doc);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `RFP_Report_${Date.now()}.docx`;
-      a.click();
-      URL.revokeObjectURL(url);
+      if (!json.ok) throw new Error(json.error || "Report generation failed");
 
-      setStatus("✅ Report generated successfully.");
-    } catch (err: any) {
-      console.error("Report generation failed", err);
+      downloadZip(json.zip);
+
       setStatus(
-        `❌ Report generation failed: ${err.message || "Unknown error"}`
+        `✅ Generated ${json.totalQuestions} questions. ZIP downloaded successfully.`
       );
+    } catch (err: any) {
+      setStatus(`❌ ${err.message}`);
     } finally {
       setLoading(false);
     }
@@ -245,30 +94,25 @@ export default function HomePage() {
       style={{
         display: "flex",
         flexDirection: "row",
-        alignItems: "flex-start",
         justifyContent: "center",
         padding: "60px 20px",
-        minHeight: "100vh",
-        background: "#f8f9fa",
         gap: "40px",
+        background: "#f8f9fa",
+        minHeight: "100vh",
       }}
     >
       <div style={{ maxWidth: 420, textAlign: "center" }}>
         <h1 style={{ fontSize: "1.8rem", fontWeight: 700 }}>
           📄 UPRISE RFP Tool
         </h1>
-        <p style={{ color: "#555", marginBottom: "1rem" }}>
-          Upload a document — we’ll ingest it automatically before generating
-          your report.
-        </p>
 
         <input
           type="file"
           onChange={(e) => setFile(e.target.files?.[0] || null)}
           style={{
             border: "1px solid #ccc",
-            borderRadius: "6px",
             padding: "8px",
+            borderRadius: "6px",
             background: "#fff",
             width: "100%",
           }}
@@ -278,59 +122,53 @@ export default function HomePage() {
           style={{
             display: "flex",
             gap: "10px",
-            marginTop: "15px",
+            marginTop: 15,
             justifyContent: "center",
           }}
         >
           <button
             onClick={ingestFile}
-            disabled={loading || !file}
+            disabled={!file || loading}
             style={{
               background: "#28a745",
-              color: "#fff",
-              border: "none",
               padding: "10px 18px",
               borderRadius: "6px",
-              cursor: loading ? "wait" : "pointer",
-              fontWeight: 600,
+              color: "white",
             }}
           >
-            Ingest to Knowledge Base
+            Ingest
           </button>
 
           <button
             onClick={handleGenerate}
-            disabled={loading || !file}
+            disabled={!file || loading}
             style={{
               background: "#007bff",
-              color: "#fff",
-              border: "none",
               padding: "10px 18px",
               borderRadius: "6px",
-              cursor: loading ? "wait" : "pointer",
-              fontWeight: 600,
+              color: "white",
             }}
           >
-            {loading ? "Processing..." : "Generate RFP Report"}
+            {loading ? "Processing…" : "Generate All Reports (ZIP)"}
           </button>
         </div>
 
         {status && (
           <div
             style={{
-              marginTop: "20px",
-              background: "#fff",
-              padding: "10px 20px",
+              marginTop: 20,
+              padding: "12px 20px",
               borderRadius: "6px",
+              background: "#fff",
               boxShadow: "0 1px 4px rgba(0,0,0,0.1)",
-              color: status.startsWith("❌")
-                ? "red"
-                : status.startsWith("⚠️")
-                ? "#b58900"
-                : "green",
-              minHeight: "50px",
-              whiteSpace: "pre-line",
               fontWeight: 500,
+              whiteSpace: "pre-wrap",
+              color:
+                status.startsWith("❌")
+                  ? "red"
+                  : status.startsWith("⚠️")
+                  ? "#b58900"
+                  : "green",
             }}
           >
             {status}
@@ -340,13 +178,12 @@ export default function HomePage() {
 
       <div
         style={{
-          width: "400px",
-          maxHeight: "600px",
-          background: "#fff",
-          borderRadius: "12px",
+          width: 400,
+          maxHeight: 600,
+          background: "white",
+          borderRadius: 12,
           boxShadow: "0 2px 10px rgba(0,0,0,0.1)",
           overflow: "hidden",
-          flexShrink: 0,
         }}
       >
         <ChatWidget />

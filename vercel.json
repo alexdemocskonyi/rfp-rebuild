@@ -1,0 +1,27 @@
+{
+  "functions": {
+    "app/api/generate-report/route.ts": {
+      "runtime": "vercel-nodejs@20.0.0",
+      "maxDuration": 800,
+      "memory": 2048
+    },
+    "app/api/reindex/route.ts": {
+      "runtime": "vercel-nodejs@20.0.0",
+      "maxDuration": 800,
+      "memory": 2048
+    },
+    "app/api/chat/route.ts": {
+      "runtime": "vercel-nodejs@20.0.0",
+      "maxDuration": 800,
+      "memory": 2048
+    },
+    "app/api/ingest/route.ts": {
+      "runtime": "vercel-nodejs@20.0.0",
+      "maxDuration": 800,
+      "memory": 2048
+    }
+  },
+  "env": {
+    "NODE_OPTIONS": "--max-old-space-size=8192"
+  }
+}

@@ -1,29 +1,30 @@
-import { NextRequest, NextResponse } from "next/server";
-
 export const runtime = "nodejs";
 
-function cosineSim(a: number[], b: number[]) {
-  const dot = a.reduce((sum, v, i) => sum + v * b[i], 0);
-  const normA = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
-  const normB = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
-  return dot / (normA * normB);
-}
+import { NextRequest, NextResponse } from "next/server";
+import OpenAI from "openai";
 
-async function getEmbedding(query: string): Promise<number[]> {
-  const res = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      input: query,
-      model: "text-embedding-3-small"
-    })
-  });
-  const data = await res.json();
-  if (!data.data || !data.data[0]) throw new Error("Failed to embed query");
-  return data.data[0].embedding;
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+const FALLBACK_BLOB_BASE =
+  "https://9q4ay5sxapz9hmj4.public.blob.vercel-storage.com";
+const KB_PATH = "kb.json";
+
+async function getEmbeddingSafe(text: string): Promise<number[]> {
+  try {
+    const res = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({ model: "text-embedding-3-small", input: text }),
+    });
+    const data = await res.json();
+    if (!data.data || !data.data[0]) throw new Error("Failed to embed query");
+    return data.data[0].embedding;
+  } catch (err) {
+    console.error("❌ EMBEDDING ERROR", err);
+    return [];
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -31,27 +32,29 @@ export async function POST(req: NextRequest) {
     const { query } = await req.json();
     if (!query) throw new Error("Missing query text");
 
-    const kbUrl = process.env.BLOB_BASE_URL
-      ? `${process.env.BLOB_BASE_URL}/kb.json`
-      : "https://nwavns9phcxcbmyj.public.blob.vercel-storage.com/kb.json";
+    const emb = await getEmbeddingSafe(query);
+    const kbUrl = `${process.env.BLOB_BASE_URL || FALLBACK_BLOB_BASE}/${KB_PATH}`;
+    const kbRes = await fetch(kbUrl, { cache: "no-store" });
+    if (!kbRes.ok) throw new Error("Failed to fetch KB");
+    const kb = await kbRes.json();
 
-    const kb = await fetch(kbUrl).then(r => r.json());
-    if (!Array.isArray(kb)) throw new Error("Invalid KB format");
+    let best = { score: -1, match: null as any };
+    for (const item of kb) {
+      if (!item.embedding) continue;
+      const dot = emb.reduce((s, v, i) => s + v * item.embedding[i], 0);
+      if (dot > best.score) best = { score: dot, match: item };
+    }
 
-    const qEmb = await getEmbedding(query);
-
-    const scored = kb
-      .filter((item: any) => Array.isArray(item.embedding))
-      .map((item: any) => ({
-        question: item.question,
-        answer: item.answer,
-        score: cosineSim(qEmb, item.embedding)
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
-
-    return NextResponse.json({ query, results: scored });
+    return NextResponse.json({
+      ok: true,
+      bestMatch: best.match,
+      score: best.score,
+    });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    console.error("❌ TEST_MATCH_ERROR", err);
+    return NextResponse.json(
+      { ok: false, error: err.message },
+      { status: 500 }
+    );
   }
 }

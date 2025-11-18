@@ -1,117 +1,190 @@
+// app/api/ingest/route.ts
+export const runtime = "nodejs";
+
 import { NextRequest, NextResponse } from "next/server";
 import { put } from "@vercel/blob";
 import { parseUnified } from "@/lib/unifiedParser";
+import { getEmbedding } from "@/lib/embed";
 
-export const runtime = "nodejs";
+const BLOB_BASE_URL =
+  "https://ynyzmdodop38gqsz.public.blob.vercel-storage.com";
+const BLOB_TOKEN =
+  "vercel_blob_rw_YnyZMdOdop38gqSz_5D6vQd4WlLmEGx76qZpzxpSfne7Ms4";
 const KB_PATH = "kb.json";
-const BATCH = 12;
+const CHUNK_SIZE = 50;
+const PARALLEL = 10;
 
+function norm(s: any) {
+  return (s ?? "").toString().replace(/\s+/g, " ").trim();
+}
 function normalize(s: string) {
   return s.toLowerCase().replace(/\s+/g, " ").trim();
 }
-function keyFor(q: string, a: string, source: string) {
-  return `${normalize(q)}|${normalize(a)}|${normalize(source)}`;
-}
-function isLikelyContext(text: string) {
-  const t = text.trim();
-  if (!t) return false;
-  const words = t.split(/\s+/).length;
-  const hasQuestionMark = /[?？]/.test(t);
-  return words >= 20 && !hasQuestionMark;
-}
-function snippetOf(text: string, maxWords = 12) {
-  const words = text.trim().split(/\s+/);
-  const snip = words.slice(0, maxWords).join(" ");
-  return words.length > maxWords ? `${snip}…` : snip;
-}
-
-async function getEmbeddingSafe(text: string): Promise<number[]> {
-  const key = process.env.OPENAI_API_KEY;
-  const res = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-    body: JSON.stringify({ input: text, model: "text-embedding-3-small" }),
-  });
-  const data = await res.json();
-  return data.data?.[0]?.embedding ?? [];
+function keyFor(q: string, a: string, src: string) {
+  return `${normalize(q)}|${normalize(a)}|${normalize(src)}`;
 }
 
 export async function POST(req: NextRequest) {
-  console.log("🚀 [INGEST] invoked");
+  console.log("🚀 [INGEST] route triggered");
   try {
     const form = await req.formData();
     const file = form.get("file") as File | null;
-    if (!file) throw new Error("No file provided");
+    if (!file) {
+      return NextResponse.json(
+        { ok: false, error: "No file provided" },
+        { status: 400 }
+      );
+    }
 
     const buf = Buffer.from(await file.arrayBuffer());
-    const parsed = await parseUnified(buf, file.name);
-    console.log(`[INGEST] parsed ${parsed.length} rows`);
+    const filename = file.name || "upload.bin";
+    console.log(`📄 Processing file: ${filename}`);
 
-    if (parsed.length === 0)
-      return NextResponse.json({ ok: false, reason: "No questions found." });
+    const parsed = await parseUnified(buf, filename);
+    console.log(`📄 Parsed ${parsed.length} raw rows from file`);
 
-    // Upload source file for reference
-    const uploaded = await put(`uploads/${file.name}`, buf, {
+    if (!parsed.length) {
+      return NextResponse.json(
+        { ok: false, error: "No Q/A entries found" },
+        { status: 400 }
+      );
+    }
+
+    // Always upload the raw source file so we have it
+    const uploaded = await put(`uploads/${filename}`, buf, {
       access: "public",
+      token: BLOB_TOKEN,
       addRandomSuffix: true,
-      token: process.env.BLOB_READ_WRITE_TOKEN,
     });
-    const origin = process.env.BLOB_BASE_URL || new URL(uploaded.url).origin;
-    const kbUrl = `${origin}/${KB_PATH}`;
+    console.log(`📤 Uploaded source: ${uploaded.url}`);
 
+    // Only consider rows with a meaningful answer
+    const answered = parsed.filter(
+      (r) => norm(r.answer).length > 3 && norm(r.question).length > 0
+    );
+    const answeredCount = answered.length;
+
+    console.log(
+      `🧮 Answered rows: ${answeredCount}/${parsed.length} (>=4 chars answers)`
+    );
+
+    // Heuristic: if it's basically all questions & no answers, skip KB update
+    const minThreshold = Math.max(5, Math.floor(parsed.length * 0.2)); // at least 5 & 20%
+    if (answeredCount < minThreshold) {
+      console.warn(
+        `⚠️ [INGEST] File looks like QUESTION-ONLY (answers: ${answeredCount}/${parsed.length}) – skipping KB update`
+      );
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        total: 0,
+        reason:
+          "File appears to contain questions only (very few or no answers). Knowledge Base was not modified, but you can still generate a report using this file as the RFP source.",
+      });
+    }
+
+    // Load existing KB
+    const kbUrl = `${BLOB_BASE_URL}/${KB_PATH}?t=${Date.now()}`;
     let existing: any[] = [];
     try {
       const res = await fetch(kbUrl, { cache: "no-store" });
-      if (res.ok) existing = await res.json();
-    } catch {}
-
-    const seen = new Map<string, number>();
-    for (const row of existing)
-      seen.set(keyFor(row.question, row.answer, row.source || ""), 1);
-
-    const newRows: any[] = [];
-    let pairs = 0, contexts = 0, qOnly = 0;
-
-    for (const r of parsed) {
-      const q = r.question?.trim();
-      const a = r.answer?.trim();
-      const s = r.source || file.name.replace(/\.[^.]+$/, "");
-
-      if (q && a) {
-        const k = keyFor(q, a, s);
-        if (!seen.has(k)) {
-          newRows.push({ question: q, answer: a, source: s });
-          pairs++;
-        }
-      } else if (!a && q) qOnly++;
-      else if (!q && isLikelyContext(a)) contexts++;
+      if (res.ok) {
+        existing = await res.json();
+        console.log(`📚 Loaded existing KB with ${existing.length} entries`);
+      } else {
+        console.log("ℹ️ Existing KB fetch not OK, starting fresh");
+      }
+    } catch {
+      console.log("ℹ️ No existing KB found or fetch failed, starting fresh");
     }
+    if (!Array.isArray(existing)) existing = [];
 
-    console.log(`[INGEST] pairs=${pairs}, qOnly=${qOnly}, ctx=${contexts}`);
+    const seen = new Set(
+      existing.map((e) =>
+        keyFor(
+          e.question || "",
+          e.answer || "",
+          e.source || "unknown-source"
+        )
+      )
+    );
 
-    if (newRows.length === 0) {
-      console.warn("[INGEST] nothing new to embed; continuing for report use");
-      return NextResponse.json({ ok: true, skipped: true, kbUrl, reason: "Q-only file" });
-    }
-
-    for (const r of newRows) {
-      r.embedding = await getEmbeddingSafe(`${r.question}\n${r.answer}`);
-      existing.push(r);
-    }
-
-    const saved = await put(KB_PATH, JSON.stringify(existing, null, 2), {
-      access: "public",
-      addRandomSuffix: false,
-      allowOverwrite: true,
-      contentType: "application/json",
-      token: process.env.BLOB_READ_WRITE_TOKEN,
+    // Only add NEW answered rows
+    const newRows = answered.filter((r) => {
+      const q = norm(r.question);
+      const a = norm(r.answer);
+      const src = r.source || filename;
+      if (!q || !a) return false; // hard-stop on empty
+      const k = keyFor(q, a, src);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
     });
 
-    console.log(`✅ [INGEST] KB updated: ${saved.url}`);
+    console.log(`🧩 Will embed ${newRows.length} new answered rows`);
 
-    return NextResponse.json({ ok: true, added: newRows.length, total: existing.length, kbUrl: saved.url });
+    if (!newRows.length) {
+      return NextResponse.json({
+        ok: true,
+        skipped: false,
+        total: 0,
+        reason: "All answered rows were already present in KB.",
+      });
+    }
+
+    // Embed & append in chunks
+    let added = 0;
+
+    for (let i = 0; i < newRows.length; i += CHUNK_SIZE) {
+      const chunk = newRows.slice(i, i + CHUNK_SIZE);
+
+      for (let j = 0; j < chunk.length; j += PARALLEL) {
+        const batch = chunk.slice(j, j + PARALLEL);
+
+        const embeds = await Promise.all(
+          batch.map((r) =>
+            getEmbedding(`${norm(r.question)}\n${norm(r.answer)}`)
+          )
+        );
+
+        for (let k = 0; k < batch.length; k++) {
+          batch[k].question = norm(batch[k].question);
+          batch[k].answer = norm(batch[k].answer);
+          batch[k].source = batch[k].source || filename;
+          batch[k].embedding = embeds[k];
+        }
+      }
+
+      existing.push(...chunk);
+      added += chunk.length;
+
+      await put(KB_PATH, JSON.stringify(existing, null, 2), {
+        access: "public",
+        token: BLOB_TOKEN,
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        contentType: "application/json",
+      });
+
+      console.log(
+        `💾 Saved partial KB batch. Current KB size: ${existing.length}`
+      );
+    }
+
+    console.log(
+      `✅ KB updated successfully – added ${added} answered entries. New total: ${existing.length}`
+    );
+
+    return NextResponse.json({
+      ok: true,
+      skipped: false,
+      total: added, // NEW entries count
+    });
   } catch (err: any) {
-    console.error("❌ [INGEST_ERROR]", err);
-    return NextResponse.json({ ok: false, error: err.message }, { status: 500 });
+    console.error("❌ INGEST_ERROR", err);
+    return NextResponse.json(
+      { ok: false, error: err.message || "Unknown" },
+      { status: 500 }
+    );
   }
 }
