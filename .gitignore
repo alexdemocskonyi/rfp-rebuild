@@ -20,3 +20,8 @@ backups/
 .DS_Store
 .vercel
 .env*.local
+
+# Local backup archives (do not track in git)
+.full-backups/
+.rfp-full-backups/
+.rfp-backups/
