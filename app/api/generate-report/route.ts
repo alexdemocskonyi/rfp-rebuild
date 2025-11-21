@@ -1,12 +1,8 @@
 /**
  * app/api/generate-report/route.ts
- * - No name redaction in outputs (DOCX sanitizer only cleans control chars)
- * - Policy layer on answers:
- *    - Omit individual human names in answers
- *    - Never answer female/woman-owned/leadership-gender questions directly
- *    - Always respond with Irvine, CA for Uprise HQ/location questions
- * - For XLSX uploads, Replica_Answers.xlsx is the ORIGINAL workbook
- *   with AI answers written into the answer column.
+ * - No name redaction in outputs
+ * - XLSX replica = original workbook with AI answers written into answer column
+ * - DOCX replica (Option B) = original .docx edited in place by patching document.xml
  */
 
 export const runtime = "nodejs";
@@ -26,34 +22,14 @@ import { buildReplicaDocx } from "@/lib/fillReplicaDocx";
 import { buildXlsxReport } from "@/lib/buildXlsxReport";
 
 /* -----------------------------------
-   GLOBAL SAFE TERMS
------------------------------------- */
-
-// NEVER redact these (exact or case-insensitive)
-const SAFE_TERMS = [
-  "Uprise Health",
-  "UPRISE HEALTH",
-  "uprise health",
-];
-
-/* -----------------------------------
-   DOCX SANITIZER (reports only)
-   - No redaction, just control-char cleanup
+   DOCX sanitizer (reports only)
+   No redaction, just control character cleanup
 ------------------------------------ */
 
 export function sanitizeForDocx(input: any): string {
-  let s = (input ?? "").toString();
-
-  // strip control chars
-  s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
-
-  // remove unpaired surrogates
-  s = s.replace(
-    /([\uD800-\uDBFF])(?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])([\uDC00-\uDFFF])/g,
-    ""
-  );
-
-  return s.trim();
+  const raw = input == null ? "" : String(input);
+  // remove C0 control characters
+  return raw.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").trim();
 }
 
 /* ---------------------------------- Helpers --------------------------------- */
@@ -66,162 +42,53 @@ const Q_HEADER_REGEX = /(question|prompt|rfp\s*item|inquiry|ask)/i;
 const A_HEADER_REGEX =
   /(answer|response|reply|details|description|explanation|ai\s*answer)/i;
 
-function norm(s: any) {
-  return (s ?? "").toString().replace(/\s+/g, " ").trim();
+function norm(value: any): string {
+  if (value == null) return "";
+  return String(value).replace(/\s+/g, " ").trim();
 }
 
-function normalizeVendorNames(text: string) {
-  if (!text) return text;
+function normalizeVendorNames(text: string): string {
+  if (text.length === 0) return text;
   return text.replace(
     /\b(H.?C\s*HealthWorks|HMC\s*HealthWorks|HMC\b|IBH\b|Claremont\s+Behavioral\s+Health)\b/gi,
     "Uprise Health"
   );
 }
 
-function needsNumeric(q: string) {
-  const t = q.toLowerCase();
+function needsNumeric(question: string): boolean {
+  const t = question.toLowerCase();
   return /# of|number of|how many|count|percentage|%|rate|current\s+app\s+store/.test(
     t
   );
 }
 
-function safeSnippet(s: string) {
+/**
+ * Normalize question strings into a stable key so we can match
+ * workbook / docx content to parsed items by text, not row index.
+ */
+function makeQuestionKey(source: string): string {
+  let t = norm(source).toLowerCase();
+  if (t.length === 0) return "";
+
+  // normalize curly quotes
+  t = t.replace(/[\u2018\u2019]/g, "'");
+  t = t.replace(/[\u201C\u201D]/g, '"');
+
+  // drop trailing punctuation
+  t = t.replace(/[?.,;:]+$/g, "");
+
+  // drop quotes
+  t = t.replace(/["'`]/g, "");
+
+  return t.trim();
+}
+
+function safeSnippet(text: string): string {
   try {
-    return normalizeVendorNames(norm(s));
+    return normalizeVendorNames(norm(text));
   } catch {
     return "";
   }
-}
-
-/* ----------------------------------
-   Policy helpers (ownership / names / location)
------------------------------------- */
-
-function normalizeUpriseLocation(text: string): string {
-  if (!text) return text;
-  let out = text;
-
-  // Kill legacy/bad HQ references
-  out = out.replace(/\bJupiter,\s*FL(?:orida)?\b/gi, "Irvine, CA");
-  out = out.replace(/\bJupiter\s+Florida\b/gi, "Irvine, CA");
-
-  return out;
-}
-
-function scrubIndividualNames(text: string): string {
-  if (!text) return text;
-
-  let out = text;
-
-  // preserve company name spelling
-  SAFE_TERMS.forEach((t) => {
-    out = out.replace(new RegExp(t, "gi"), t);
-  });
-
-  // Titles + names (Dr. Jane Doe -> "Dr.")
-  out = out.replace(
-    /\b(Dr\.|Mr\.|Ms\.|Mrs\.|Prof\.)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g,
-    "$1"
-  );
-
-  // Obvious "First Last" personal names, but avoid corporate suffixes
-  const NON_PEOPLE_WORDS = [
-    "Health",
-    "Center",
-    "Plaza",
-    "Building",
-    "Services",
-    "Corp",
-    "LLC",
-    "Inc",
-    "Systems",
-    "Solutions",
-    "Behavioral",
-  ];
-
-  out = out.replace(
-    /\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b/g,
-    (match: string, first: string, last: string) => {
-      const combined = first + " " + last;
-
-      // Preserve explicit safe terms
-      if (
-        SAFE_TERMS.some(
-          (t) => t.toLowerCase() === combined.toLowerCase()
-        )
-      ) {
-        return combined;
-      }
-
-      // Preserve corporate / non-person endings
-      if (NON_PEOPLE_WORDS.indexOf(last) !== -1) return combined;
-
-      // Otherwise treat as personal name
-      return "[redacted]";
-    }
-  );
-
-  return out;
-}
-
-function scrubFemaleOwnershipClaims(text: string): string {
-  if (!text) return text;
-  let out = text;
-
-  // Woman-owned / female-owned / similar claims
-  out = out.replace(
-    /\b(female|woman|women)[-\s]?owned\b[^.]*\./gi,
-    "Ownership or leadership demographics are not provided in this context."
-  );
-
-  // Leadership gender claims
-  out = out.replace(
-    /\b(female|woman|women)[-\s]?(ceo|cfo|founder|owner|leader|chair|executive|president)\b[^.]*\./gi,
-    "Leadership demographics are not provided in this context."
-  );
-
-  return out;
-}
-
-function isFemaleOwnershipQuestion(q: string): boolean {
-  const t = norm(q).toLowerCase();
-  return /woman[-\s]?owned|women[-\s]?owned|female[-\s]?owned|minority[-\s]?owned|women[-\s]led|female[-\s]led/.test(
-    t
-  );
-}
-
-function isLeadershipGenderQuestion(q: string): boolean {
-  const t = norm(q).toLowerCase();
-  return /(male|female|woman|women)\s+(ceo|cfo|founder|owner|leader|chair|executive|president)/.test(
-    t
-  );
-}
-
-function isLocationQuestion(q: string): boolean {
-  const t = norm(q).toLowerCase();
-  return /(headquarters?|hq|where.*uprise.*located|uprise health location|primary office location|corporate headquarters)/.test(
-    t
-  );
-}
-
-function applyUprisePolicy(question: string, answer: string): string {
-  let a = norm(answer);
-
-  // Direct policy overrides based on the question itself
-  if (isFemaleOwnershipQuestion(question) || isLeadershipGenderQuestion(question)) {
-    return "Ownership and leadership demographics (including gender or minority status) are not provided; we encourage focusing on Uprise Health’s services and capabilities instead.";
-  }
-
-  if (isLocationQuestion(question)) {
-    return "Uprise Health is headquartered in Irvine, CA.";
-  }
-
-  // Otherwise, clean the text
-  a = normalizeUpriseLocation(a);
-  a = scrubFemaleOwnershipClaims(a);
-  a = scrubIndividualNames(a);
-
-  return a;
 }
 
 /* --------------------------------------------------------------------------- */
@@ -237,73 +104,124 @@ export type QAItem = {
 };
 
 /* ---------------------------------------------------------------------------
-   XLSX REPLICA HELPER – EDIT ORIGINAL WORKBOOK IN PLACE
+   XLSX replica helper
+   Edit original workbook and add answers
 --------------------------------------------------------------------------- */
 
+/**
+ * Find the header row for a sheet by scanning the first few rows
+ * for something that looks like a question or answer column header.
+ */
+function findHeaderRow(ws: XLSX.WorkSheet, range: XLSX.Range): number {
+  const maxScanRow = Math.min(range.e.r, range.s.r + 15);
+  for (let r = range.s.r; r <= maxScanRow; r++) {
+    let hasHeader = false;
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const addr = XLSX.utils.encode_cell({ r, c });
+      const cell = (ws as any)[addr];
+      const header = norm(cell && (cell.v ?? cell.w));
+      if (header.length === 0) continue;
+      if (Q_HEADER_REGEX.test(header) || A_HEADER_REGEX.test(header)) {
+        hasHeader = true;
+        break;
+      }
+    }
+    if (hasHeader) return r;
+  }
+  // fallback: top row
+  return range.s.r;
+}
+
+/**
+ * For XLSX:
+ * - open the original workbook
+ * - identify question and answer columns by headers (or best guess)
+ * - for each row whose question text matches a parsed QAItem.question,
+ *   drop the AI answer into the answer column
+ * - if there is no clear answer column, create a new "AI Answer" column
+ *   at the far right and write into that
+ */
 function buildReplicaWorkbookFromOriginalXlsx(
   items: QAItem[],
   originalBuffer: Buffer
 ): Buffer {
-  // 1) Load original workbook
   const wb = XLSX.read(originalBuffer, { type: "buffer" });
 
-  // 2) Build lookup: question text -> aiAnswer (lowercased key)
   const qaMap = new Map<string, string>();
   for (const item of items) {
-    const qKey = norm(item.question).toLowerCase();
-    if (!qKey) continue;
-    if (!qaMap.has(qKey)) {
-      qaMap.set(qKey, item.aiAnswer || "Information not found in KB.");
+    const key = makeQuestionKey(item.question);
+    if (key.length === 0) continue;
+    if (qaMap.has(key) === false) {
+      const answer =
+        item.aiAnswer && item.aiAnswer.trim().length > 0
+          ? item.aiAnswer
+          : "Information not found in KB.";
+      qaMap.set(key, answer);
     }
   }
 
-  // 3) Walk each sheet and update answer cells
+  const refKey = String.fromCharCode(33) + "ref";
+
   for (const sheetName of wb.SheetNames) {
     const ws = wb.Sheets[sheetName];
-    if (!ws || !ws["!ref"]) continue;
+    if (ws === undefined || ws === null) continue;
 
-    const range = XLSX.utils.decode_range(ws["!ref"]);
+    const refValue = (ws as any)[refKey];
+    if (refValue === undefined || refValue === null) continue;
+
+    const range = XLSX.utils.decode_range(refValue);
     if (range.s.r > range.e.r || range.s.c > range.e.c) continue;
 
-    // Assume first row is header row (same assumption as parseUnified)
-    const headerRow = range.s.r;
+    const headerRow = findHeaderRow(ws, range);
 
-    // Discover question and answer columns from header names
-    let qCol: number | null = null;
+    let qCol: number = range.s.c;
     let aCol: number | null = null;
 
     for (let c = range.s.c; c <= range.e.c; c++) {
       const addr = XLSX.utils.encode_cell({ r: headerRow, c });
-      const cell = ws[addr];
+      const cell = (ws as any)[addr];
       const header = norm(cell && (cell.v ?? cell.w));
-      if (!header) continue;
+      if (header.length === 0) continue;
 
-      if (qCol === null && Q_HEADER_REGEX.test(header)) qCol = c;
+      if (Q_HEADER_REGEX.test(header)) qCol = c;
       if (aCol === null && A_HEADER_REGEX.test(header)) aCol = c;
     }
 
-    // Fallbacks:
-    // - If no explicit question header, use first column as Q
-    // - If no explicit answer header, use next column as A (or same if none)
-    if (qCol === null) qCol = range.s.c;
     if (aCol === null) {
-      aCol = qCol + 1 <= range.e.c ? qCol + 1 : qCol;
+      aCol = range.e.c + 1;
+      const headerAddr = XLSX.utils.encode_cell({ r: headerRow, c: aCol });
+      (ws as any)[headerAddr] = {
+        t: "s",
+        v: "AI Answer",
+      };
+      range.e.c = aCol;
+      (ws as any)[refKey] = XLSX.utils.encode_range(range);
     }
 
-    // 4) Update data rows
+    const answerCol = aCol as number;
+
     for (let r = headerRow + 1; r <= range.e.r; r++) {
       const qAddr = XLSX.utils.encode_cell({ r, c: qCol });
-      const qCell = ws[qAddr];
-      const qText = norm(qCell && (qCell.v ?? qCell.w));
-      if (!qText) continue;
+      const qCell = (ws as any)[qAddr];
+      const questionText = norm(qCell && (qCell.v ?? qCell.w));
+      if (questionText.length === 0) continue;
 
-      const key = qText.toLowerCase();
+      const key = makeQuestionKey(questionText);
+      if (key.length === 0) continue;
+
       const aiAnswer = qaMap.get(key);
-      if (!aiAnswer) continue; // no AI answer for this question
+      if (
+        aiAnswer === undefined ||
+        aiAnswer === null ||
+        aiAnswer.trim().length === 0
+      ) {
+        continue;
+      }
 
-      const aAddr = XLSX.utils.encode_cell({ r, c: aCol });
-      const existing = ws[aAddr] || {};
-      ws[aAddr] = {
+      const aAddr = XLSX.utils.encode_cell({ r, c: answerCol });
+      const existing = (ws as any)[aAddr] || {};
+
+      (ws as any)[aAddr] = {
         ...existing,
         t: "s",
         v: aiAnswer,
@@ -311,13 +229,118 @@ function buildReplicaWorkbookFromOriginalXlsx(
     }
   }
 
-  // 5) Write back to buffer as XLSX (same structure, filled answers)
   const out = XLSX.write(wb, { bookType: "xlsx", type: "buffer" }) as Buffer;
   return Buffer.from(out);
 }
 
 /* ---------------------------------------------------------------------------
-   MAIN REPORT GENERATION ROUTE
+   DOCX replica helper (Option B)
+   Edit original DOCX document.xml in place and insert answers after questions,
+   cloning the paragraph properties (w:pPr) from the question paragraph so
+   formatting stays as close to the original as possible.
+--------------------------------------------------------------------------- */
+
+function escapeXml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+async function buildReplicaDocxFromOriginalDocx(
+  items: QAItem[],
+  originalBuffer: Buffer
+): Promise<Buffer> {
+  try {
+    const zip = await JSZip.loadAsync(originalBuffer);
+    const docFile = zip.file("word/document.xml");
+    if (docFile == null) {
+      // Fallback to the old docx builder if document.xml is missing
+      return await buildReplicaDocx(items, "Replica_Answers.docx");
+    }
+
+    let xml = await docFile.async("string");
+
+    // Build map from normalized question key to sanitized answer
+    const qaMap = new Map<string, string>();
+    for (const item of items) {
+      const key = makeQuestionKey(item.question);
+      if (key.length === 0) continue;
+      if (qaMap.has(key)) continue;
+      const baseAnswer =
+        item.aiAnswer && item.aiAnswer.trim().length > 0
+          ? item.aiAnswer
+          : "Information not found in KB.";
+      qaMap.set(key, sanitizeForDocx(baseAnswer));
+    }
+
+    const questionList = items.map((it) => it.question);
+
+    function findOriginalQuestionText(key: string): string {
+      for (const q of questionList) {
+        if (makeQuestionKey(q) === key) return q;
+      }
+      return "";
+    }
+
+    for (const [qKey, answer] of qaMap.entries()) {
+      const originalQuestion = findOriginalQuestionText(qKey);
+      if (originalQuestion.length === 0) continue;
+
+      const needleText = norm(originalQuestion);
+      if (needleText.length === 0) continue;
+
+      const needle = "<w:t>" + escapeXml(needleText) + "</w:t>";
+      const startIndex = xml.indexOf(needle);
+      if (startIndex < 0) {
+        // Question text may be split across multiple runs; skip gracefully
+        continue;
+      }
+
+      const paragraphStart = xml.lastIndexOf("<w:p", startIndex);
+      const paragraphEnd = xml.indexOf("</w:p>", startIndex);
+      if (paragraphStart < 0 || paragraphEnd < 0) continue;
+
+      const paraXml = xml.slice(
+        paragraphStart,
+        paragraphEnd + "</w:p>".length
+      );
+
+      let pPrXml = "";
+      const pPrStart = paraXml.indexOf("<w:pPr");
+      if (pPrStart >= 0) {
+        const pPrEnd = paraXml.indexOf("</w:pPr>", pPrStart);
+        if (pPrEnd >= 0) {
+          pPrXml = paraXml.slice(pPrStart, pPrEnd + "</w:pPr>".length);
+        }
+      }
+
+      const insertPos = paragraphEnd + "</w:p>".length;
+
+      const answerParagraph =
+        "<w:p>" +
+        pPrXml +
+        "<w:r>" +
+        "<w:t>" +
+        escapeXml(answer) +
+        "</w:t>" +
+        "</w:r>" +
+        "</w:p>";
+
+      xml = xml.slice(0, insertPos) + answerParagraph + xml.slice(insertPos);
+    }
+
+    zip.file("word/document.xml", xml);
+    const updated = await zip.generateAsync({ type: "nodebuffer" });
+    return Buffer.from(updated);
+  } catch (err) {
+    console.error("DOCX replica error", err);
+    return await buildReplicaDocx(items, "Replica_Answers.docx");
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Main report generation route
 --------------------------------------------------------------------------- */
 
 export async function POST(req: NextRequest) {
@@ -327,7 +350,7 @@ export async function POST(req: NextRequest) {
     const form = await req.formData();
     const file = form.get("file") as File | null;
 
-    if (!file) {
+    if (file === null) {
       return NextResponse.json({ ok: false, error: "No file provided" });
     }
 
@@ -339,7 +362,7 @@ export async function POST(req: NextRequest) {
     console.log("Parsing document:", filename);
     const parsed = await parseUnified(buf, filename);
 
-    if (!parsed.length) {
+    if (parsed.length === 0) {
       return NextResponse.json({
         ok: false,
         error: "No valid questions found in file",
@@ -347,13 +370,17 @@ export async function POST(req: NextRequest) {
     }
 
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_KEY) throw new Error("Missing OPENAI_API_KEY");
+    if (typeof OPENAI_KEY === "string" && OPENAI_KEY.length > 0) {
+      // ok
+    } else {
+      throw new Error("Missing OPENAI_API_KEY");
+    }
 
     const items: QAItem[] = [];
 
     for (let i = 0; i < parsed.length; i++) {
       const qRaw = norm(parsed[i].question);
-      if (!qRaw) continue;
+      if (qRaw.length === 0) continue;
 
       const emb = await getEmbedding(qRaw);
       const matches = await retrieveMatches(emb, TOP_K, qRaw);
@@ -366,11 +393,12 @@ export async function POST(req: NextRequest) {
       const deduped: any[] = [];
 
       for (const m of good) {
-        const key = norm(m.answer).toLowerCase();
-        if (!seen.has(key)) {
-          seen.add(key);
-          deduped.push(m);
-        }
+        const answerText = norm(m.answer);
+        const key = answerText.toLowerCase();
+        if (key.length === 0) continue;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(m);
       }
 
       const candidateBlock =
@@ -379,7 +407,7 @@ export async function POST(req: NextRequest) {
               .map(
                 (m, idx) =>
                   "[Answer " +
-                  (idx + 1) +
+                  String(idx + 1) +
                   "]\n" +
                   normalizeVendorNames(norm(m.answer))
               )
@@ -388,11 +416,8 @@ export async function POST(req: NextRequest) {
 
       const prompt = [
         "You are an expert RFP analyst for Uprise Health.",
-        "Use ONLY facts from the candidate answers.",
+        "Use only facts from the candidate answers.",
         "Normalize legacy vendor names.",
-        "Do NOT include any individual people’s names in your answer; refer to roles or teams instead.",
-        "If the question asks whether Uprise Health is woman-owned, female-owned, minority-owned, or about the gender of owners or executives, do NOT answer that directly; instead say that ownership and leadership demographics are not provided and focus on services and capabilities.",
-        "If the question is about Uprise Health’s headquarters or location, always answer that Uprise Health is headquartered in Irvine, CA.",
         "If nothing applies, respond exactly: Information not found in KB.",
         "",
         "Question:",
@@ -419,22 +444,27 @@ export async function POST(req: NextRequest) {
         });
 
         const data = await resp.json();
-        aiAnswer = normalizeVendorNames(
-          data?.choices?.[0]?.message?.content?.trim() || aiAnswer
-        );
+        const modelAnswer =
+          data &&
+          Array.isArray(data.choices) &&
+          data.choices[0] &&
+          data.choices[0].message &&
+          typeof data.choices[0].message.content === "string"
+            ? data.choices[0].message.content.trim()
+            : "";
+        if (modelAnswer.length > 0) {
+          aiAnswer = normalizeVendorNames(modelAnswer);
+        }
       } catch (err) {
         console.error("GPT error:", err);
       }
 
-      // 🔒 Apply hard policy (names, female ownership, HQ location)
-      aiAnswer = applyUprisePolicy(qRaw, aiAnswer);
-
-      if (needsNumeric(qRaw) && !/[0-9%]/.test(aiAnswer)) {
+      if (needsNumeric(qRaw) && /[0-9%]/.test(aiAnswer) === false) {
         aiAnswer = "N/A (not available in KB).";
       }
 
       const contextual: MatchItem[] =
-        deduped[0]
+        deduped.length > 0
           ? [
               {
                 source:
@@ -449,14 +479,25 @@ export async function POST(req: NextRequest) {
       );
 
       const rawText: MatchItem[] = [];
-      for (const m of lexicalSorted) {
-        const snip = safeSnippet(m.answer);
-        if (!contextual[0] || snip !== contextual[0].snippet) {
+      if (lexicalSorted.length > 0) {
+        if (contextual.length === 0) {
+          const m0 = lexicalSorted[0];
           rawText.push({
-            source: m.source || m.origin || "Unknown source",
-            snippet: snip,
+            source: m0.source || m0.origin || "Unknown source",
+            snippet: safeSnippet(m0.answer),
           });
-          break;
+        } else {
+          for (const m of lexicalSorted) {
+            const snip = safeSnippet(m.answer);
+            if (snip === contextual[0].snippet) {
+              continue;
+            }
+            rawText.push({
+              source: m.source || m.origin || "Unknown source",
+              snippet: snip,
+            });
+            break;
+          }
         }
       }
 
@@ -472,13 +513,15 @@ export async function POST(req: NextRequest) {
     const analyst = await buildAnalystDocx(items, filename);
     const simple = await buildSimpleDocx(items, filename);
 
-    // Replica: for XLSX uploads, edit original workbook in place
     let replica: Buffer | null = null;
     let replicaExt = "docx";
 
     if (/\.(xlsx|xlsm|xls)$/i.test(lower)) {
       replica = buildReplicaWorkbookFromOriginalXlsx(items, buf);
       replicaExt = "xlsx";
+    } else if (/\.docx$/i.test(lower)) {
+      replica = await buildReplicaDocxFromOriginalDocx(items, buf);
+      replicaExt = "docx";
     } else {
       replica = await buildReplicaDocx(items, filename);
       replicaExt = "docx";

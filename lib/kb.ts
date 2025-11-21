@@ -1,4 +1,3 @@
-// lib/kb.ts
 import stringSimilarity from "string-similarity";
 import { put } from "@vercel/blob";
 
@@ -87,21 +86,31 @@ export async function loadKb(): Promise<KBItem[]> {
 export async function saveKb(items: KBItem[]) {
   const token =
     process.env.BLOB_READ_WRITE_TOKEN || process.env.VERCEL_BLOB_READ_WRITE_TOKEN;
+
   if (!token) {
     console.warn("[KB] No blob write token set; running in read-only mode.");
-    return;
+    return { ok: false, error: "No blob write token set" };
   }
+
   const body = JSON.stringify(items, null, 2);
-  const r = await put(KB_PATH, body, {
-    access: "public",
-    addRandomSuffix: false,
-    contentType: "application/json",
-    token,
-  });
-  console.log(`[KB] Saved ${items.length} rows to ${r.url}`);
+
+  try {
+    const r = await put(KB_PATH, body, {
+      access: "public",
+      addRandomSuffix: false,   // keep the same filename
+      allowOverwrite: true,     // ✅ allow overwriting existing kb.json
+      contentType: "application/json",
+      token,
+    });
+    console.log(`[KB] Saved ${items.length} rows to ${r.url}`);
+    return { ok: true, url: r.url };
+  } catch (err: any) {
+    console.error("❌ KB SAVE ERROR", err?.message || err);
+    throw err;
+  }
 }
 
-// ---------- Retrieval (unchanged behavior) ----------
+// ---------- Retrieval ----------
 export async function retrieveMatches(
   queryEmbedding: number[],
   limit = 5,

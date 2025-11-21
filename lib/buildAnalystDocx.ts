@@ -6,16 +6,14 @@ import {
   TextRun,
 } from "docx";
 
-// Type-only import, erased at runtime – no circular dependency
 import type { QAItem } from "@/app/api/generate-report/route";
 
 /**
- * Local sanitizer (NO name redaction)
- * We only strip control characters and invalid surrogates,
- * same behavior as your Simple/Replica docs.
+ * Minimal sanitizer for DOCX:
+ * - remove control characters / bad surrogates
+ * - NO redaction, NO name stripping
  */
-
-function sanitizeForDocxLocal(input: any): string {
+function sanitizeForDocx(input: any): string {
   let s = (input ?? "").toString();
 
   // strip control chars
@@ -27,17 +25,16 @@ function sanitizeForDocxLocal(input: any): string {
     ""
   );
 
-  // IMPORTANT: no personal name stripping here.
   return s.trim();
 }
 
-// helper: dedupe and limit sources
+// --- helper: dedupe and limit sources ---
 function getCleanSources(sources?: string[]): string[] {
   if (!sources || !sources.length) return [];
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of sources) {
-    const s = sanitizeForDocxLocal(raw);
+    const s = sanitizeForDocx(raw);
     const key = s.toLowerCase();
     if (!s || seen.has(key)) continue;
     seen.add(key);
@@ -53,9 +50,8 @@ export async function buildAnalystDocx(
 ): Promise<Buffer> {
   const paras: Paragraph[] = [];
 
-  // ASCII-only to avoid unicode parse issues
   const title = originalFilename
-    ? "RFP Analyst Report - " + sanitizeForDocxLocal(originalFilename)
+    ? `RFP Analyst Report – ${sanitizeForDocx(originalFilename)}`
     : "RFP Analyst Report";
 
   // Title
@@ -70,8 +66,8 @@ export async function buildAnalystDocx(
   paras.push(new Paragraph({ text: "" }));
 
   items.forEach((item, idx) => {
-    const q = sanitizeForDocxLocal(item.question);
-    const a = sanitizeForDocxLocal(
+    const q = sanitizeForDocx(item.question);
+    const a = sanitizeForDocx(
       item.aiAnswer || "Information not found in KB."
     );
 
@@ -82,7 +78,7 @@ export async function buildAnalystDocx(
     // Question heading
     paras.push(
       new Paragraph({
-        text: "Question " + (idx + 1) + ": " + q,
+        text: `Question ${idx + 1}: ${q}`,
         heading: HeadingLevel.HEADING_2,
       })
     );
@@ -128,10 +124,10 @@ export async function buildAnalystDocx(
           bullet: { level: 0 },
           children: [
             new TextRun({
-              text: "[" + sanitizeForDocxLocal(m.source) + "] ",
+              text: `[${sanitizeForDocx(m.source)}] `,
               bold: true,
             }),
-            new TextRun(sanitizeForDocxLocal(m.snippet)),
+            new TextRun(sanitizeForDocx(m.snippet)),
           ],
         })
       );
@@ -150,10 +146,10 @@ export async function buildAnalystDocx(
           bullet: { level: 0 },
           children: [
             new TextRun({
-              text: "[" + sanitizeForDocxLocal(m.source) + "] ",
+              text: `[${sanitizeForDocx(m.source)}] `,
               bold: true,
             }),
-            new TextRun(sanitizeForDocxLocal(m.snippet)),
+            new TextRun(sanitizeForDocx(m.snippet)),
           ],
         })
       );
