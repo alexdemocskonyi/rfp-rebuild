@@ -1,220 +1,334 @@
-//ChatWidget.ts
+//ChatWidget.tsx
 
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useState } from "react";
 
-type Msg = { role: "user" | "assistant"; content: string };
+type ChatMessageRole = "user" | "assistant" | "system" | "error";
 
+interface ChatMessage {
+  role: ChatMessageRole;
+  content: string;
+}
+
+interface ChatApiResponse {
+  ok: boolean;
+  question?: string;
+  aiAnswer?: string;
+  message?: {
+    role: string;
+    content: string;
+  };
+  error?: string;
+  rawMatches?: any[];
+}
+
+/**
+ * Super-defensive ChatWidget:
+ * - Never throws on bad responses
+ * - Shows errors as messages instead of crashing the app
+ */
 export default function ChatWidget() {
-  const [open, setOpen] = useState(false);
-  const [messages, setMessages] = useState<Msg[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, open]);
+  const lastUserMessage = messages
+    .slice()
+    .reverse()
+    .find((m) => m.role === "user");
+  const lastAssistantMessage = messages
+    .slice()
+    .reverse()
+    .find((m) => m.role === "assistant");
 
-  async function sendMessage(e: React.FormEvent) {
-    e.preventDefault();
-    const text = input.trim();
-    if (!text || busy) return;
+  async function handleSend() {
+    const question = input.trim();
+    if (!question) {
+      // show inline error but do NOT call API
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "error",
+          content: "Please type a question before sending.",
+        },
+      ]);
+      return;
+    }
 
-    const nextMsgs: Msg[] = [...messages, { role: "user", content: text }];
-    setMessages(nextMsgs);
+    // Push the user message immediately
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: question },
+    ]);
     setInput("");
-    setBusy(true);
+    setLoading(true);
 
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          // send the whole conversation so the API has context
-          messages: nextMsgs,
-        }),
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ question }),
       });
 
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(errText || "Chat request failed");
+      let data: ChatApiResponse | null = null;
+
+      try {
+        data = (await res.json()) as ChatApiResponse;
+      } catch (jsonErr) {
+        console.error("[CHAT] Failed to parse JSON from /api/chat", jsonErr);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "error",
+            content:
+              "Chat API returned an invalid response. Please try again or refresh.",
+          },
+        ]);
+        return;
       }
 
-      const data = await res.json();
+      if (!res.ok || !data || data.ok === false) {
+        const errMsg =
+          (data && data.error) ||
+          `Request failed (status ${res.status})`;
 
-      // /api/chat returns { ok: true, content }
-      const reply =
-        data.content ||
-        data.answer ||
-        data.message ||
-        data.error ||
-        "⚠️ No response received from assistant.";
+        console.error("[CHAT] API returned error:", errMsg, data);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "error",
+            content: `Error from chat API: ${errMsg}`,
+          },
+        ]);
+        return;
+      }
 
-      setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
-    } catch (err: any) {
-      console.error("CHAT_WIDGET_ERROR", err);
+      const answerText =
+        (data.message &&
+          typeof data.message.content === "string" &&
+          data.message.content) ||
+        (typeof data.aiAnswer === "string" && data.aiAnswer) ||
+        "Chat API did not return an answer.";
+
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: answerText },
+      ]);
+    } catch (err) {
+      console.error("[CHAT] Network or runtime error:", err);
       setMessages((prev) => [
         ...prev,
         {
-          role: "assistant",
-          content: `❌ Error: ${err.message || "Unable to reach assistant."}`,
+          role: "error",
+          content:
+            "Network error talking to /api/chat. Please check your connection and try again.",
         },
       ]);
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
   }
 
-  async function saveToKB() {
-    if (saving) return;
-
-    let lastUser: Msg | undefined;
-    let lastAssistant: Msg | undefined;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (!lastAssistant && messages[i].role === "assistant")
-        lastAssistant = messages[i];
-      else if (!lastUser && messages[i].role === "user")
-        lastUser = messages[i];
-      if (lastUser && lastAssistant) break;
-    }
-
-    if (!lastUser || !lastAssistant) {
-      alert("No Q&A pair to save.");
+  async function handleSaveToKb() {
+    if (!lastUserMessage || !lastAssistantMessage) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "error",
+          content:
+            "Nothing to save yet. Ask a question and get an answer first.",
+        },
+      ]);
       return;
     }
 
-    setSaving(true);
     try {
       const res = await fetch("/api/kb-update", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+        },
         body: JSON.stringify({
-          question: lastUser.content,
-          answer: lastAssistant.content,
-          source: "chat-manual",
+          question: lastUserMessage.content,
+          answer: lastAssistantMessage.content,
+          source: "Chat Assistant",
         }),
       });
 
-      const data = await res.json();
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch (jsonErr) {
+        console.error("[KB-SAVE] Failed to parse JSON", jsonErr);
+      }
+
+      if (!res.ok || !data || data.ok === false) {
+        const msg =
+          (data && data.error) ||
+          `KB update failed (status ${res.status})`;
+        setMessages((prev) => [
+          ...prev,
+          { role: "error", content: `Save to KB failed: ${msg}` },
+        ]);
+        return;
+      }
+
       setMessages((prev) => [
         ...prev,
         {
-          role: "assistant",
-          content: data?.ok
-            ? "✅ Added to Knowledge Base."
-            : `❌ Save failed: ${data?.error || "Unknown error"}`,
+          role: "system",
+          content: "✅ Saved latest Q&A pair to the Knowledge Base.",
         },
       ]);
-    } catch (e: any) {
+    } catch (err) {
+      console.error("[KB-SAVE] Network or runtime error:", err);
       setMessages((prev) => [
         ...prev,
         {
-          role: "assistant",
-          content: `❌ Save failed: ${e?.message || "Network error"}`,
+          role: "error",
+          content:
+            "Network error while saving to Knowledge Base. Please try again.",
         },
       ]);
-    } finally {
-      setSaving(false);
+    }
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (!loading) {
+        handleSend();
+      }
     }
   }
 
   return (
-    <>
-      {/* Floating Toggle */}
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="fixed bottom-6 right-6 bg-blue-600 hover:bg-blue-700 text-white rounded-full shadow-lg w-14 h-14 flex items-center justify-center text-2xl z-[9999]"
-        title={open ? "Close chat" : "Chat with Uprise Assistant"}
-        aria-label="Chat"
-        type="button"
+    <div
+      style={{
+        borderRadius: "16px",
+        boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
+        padding: "16px",
+        maxWidth: "520px",
+        margin: "0 auto",
+        backgroundColor: "#ffffff",
+      }}
+    >
+      <h2 style={{ fontSize: "1.6rem", fontWeight: 700, marginBottom: "8px" }}>
+        Uprise Chat Assistant
+      </h2>
+
+      <div
+        style={{
+          maxHeight: "320px",
+          overflowY: "auto",
+          padding: "8px 4px",
+          marginBottom: "8px",
+          border: "1px solid #eee",
+          borderRadius: "8px",
+        }}
       >
-        💬
+        {messages.length === 0 && (
+          <div style={{ color: "#888", fontSize: "0.9rem" }}>
+            Ask a question like{" "}
+            <em>"how many licensed social workers do we have?"</em>
+          </div>
+        )}
+        {messages.map((m, idx) => {
+          const isUser = m.role === "user";
+          const isAssistant = m.role === "assistant";
+          const isError = m.role === "error";
+          const isSystem = m.role === "system";
+
+          const bg = isUser
+            ? "#e1f0ff"
+            : isAssistant
+            ? "#f5f5f5"
+            : isError
+            ? "#ffe5e5"
+            : "#f0f0f0";
+
+          return (
+            <div
+              key={idx}
+              style={{
+                marginBottom: "6px",
+                padding: "6px 8px",
+                borderRadius: "8px",
+                backgroundColor: bg,
+                fontSize: "0.95rem",
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              <strong>
+                {isUser
+                  ? "You"
+                  : isAssistant
+                  ? "Assistant"
+                  : isError
+                  ? "Error"
+                  : "System"}
+                :
+              </strong>{" "}
+              {m.content}
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
+        <input
+          type="text"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Type your question or command..."
+          style={{
+            flex: 1,
+            padding: "8px 10px",
+            borderRadius: "6px",
+            border: "1px solid #ccc",
+            fontSize: "0.95rem",
+          }}
+        />
+        <button
+          onClick={handleSend}
+          disabled={loading}
+          style={{
+            padding: "8px 14px",
+            borderRadius: "6px",
+            border: "none",
+            backgroundColor: loading ? "#888" : "#2563eb",
+            color: "#fff",
+            fontWeight: 600,
+            cursor: loading ? "default" : "pointer",
+          }}
+        >
+          {loading ? "Thinking..." : "Send"}
+        </button>
+      </div>
+
+      <button
+        type="button"
+        onClick={handleSaveToKb}
+        disabled={!lastUserMessage || !lastAssistantMessage}
+        style={{
+          padding: "6px 10px",
+          borderRadius: "6px",
+          border: "1px solid #ccc",
+          backgroundColor:
+            !lastUserMessage || !lastAssistantMessage ? "#f5f5f5" : "#e0f2fe",
+          cursor:
+            !lastUserMessage || !lastAssistantMessage
+              ? "not-allowed"
+              : "pointer",
+          fontSize: "0.85rem",
+        }}
+      >
+        💾 Save latest Q&A to Knowledge Base
       </button>
-
-      {open && (
-        <div className="fixed bottom-[90px] right-6 z-[9999] w-[360px] sm:w-[380px] bg-white border border-gray-200 rounded-xl shadow-2xl flex flex-col overflow-hidden">
-          {/* Header */}
-          <div className="flex items-center justify-between bg-blue-600 text-white px-4 py-2">
-            <h2 className="text-sm font-semibold">Uprise Chat Assistant</h2>
-            <button
-              onClick={() => setOpen(false)}
-              className="text-white hover:text-gray-100 text-xl leading-none"
-              aria-label="Close chat"
-              type="button"
-            >
-              ×
-            </button>
-          </div>
-
-          {/* Messages */}
-          <div
-            className="flex-1 overflow-y-auto px-3 py-2 space-y-2 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent"
-            style={{
-              maxHeight: "60vh",
-              overflowY: "auto",
-              wordBreak: "break-word",
-              whiteSpace: "pre-wrap",
-            }}
-          >
-            {messages.length === 0 && (
-              <div className="text-gray-500 text-sm text-center mt-4">
-                👋 Hi! How can I help with your RFP today?
-              </div>
-            )}
-            {messages.map((m, i) => (
-              <div
-                key={i}
-                className={`p-2 rounded-lg text-sm ${
-                  m.role === "user"
-                    ? "bg-blue-50 text-right border border-blue-100"
-                    : "bg-gray-50 text-left border border-gray-100"
-                }`}
-                style={{
-                  maxWidth: "100%",
-                  overflowWrap: "break-word",
-                }}
-              >
-                {m.content}
-              </div>
-            ))}
-            <div ref={messagesEndRef} />
-          </div>
-
-          {/* Save-to-KB */}
-          {messages.some((m) => m.role === "assistant") && (
-            <button
-              onClick={saveToKB}
-              disabled={saving}
-              className="mx-3 mb-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg py-1.5 px-3 transition disabled:opacity-50"
-              type="button"
-            >
-              {saving ? "Saving..." : "💾 Save to Knowledge Base"}
-            </button>
-          )}
-
-          {/* Input */}
-          <form onSubmit={sendMessage} className="flex border-t border-gray-200">
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={busy ? "Thinking..." : "Type your question or command..."}
-              disabled={busy}
-              className="flex-1 p-2 text-sm focus:outline-none"
-            />
-            <button
-              type="submit"
-              disabled={busy}
-              className="px-4 py-2 bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-            >
-              Send
-            </button>
-          </form>
-        </div>
-      )}
-    </>
+    </div>
   );
 }

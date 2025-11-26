@@ -1,3 +1,4 @@
+// lib/buildXlsxReport.ts
 import * as XLSX from "xlsx";
 import type { QAItem } from "@/app/api/generate-report/route";
 

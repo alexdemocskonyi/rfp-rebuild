@@ -1,3 +1,5 @@
+//app/uploadFix.js
+
 export async function uploadFile(file) {
   const formData = new FormData();
   formData.append("file", file);

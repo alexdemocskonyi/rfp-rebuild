@@ -1,6 +1,10 @@
 // lib/embed.ts
 // Simple embedding helper using direct fetch instead of the OpenAI SDK.
 
+function applyAliases(text: string): string {
+  return (text || "").replace(/\blsws?\b/gi, "licensed social workers");
+}
+
 export async function getEmbedding(text: string): Promise<number[]> {
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
@@ -8,7 +12,8 @@ export async function getEmbedding(text: string): Promise<number[]> {
     return [];
   }
 
-  const clean = (text || "").trim();
+  const raw = (text || "").trim();
+  const clean = applyAliases(raw);
   if (!clean) return [];
 
   try {

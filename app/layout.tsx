@@ -1,5 +1,4 @@
 import "./globals.css";
-import ChatWidget from "@/components/ChatWidget";
 
 export const metadata = {
   title: "RFP AI Generator — Minimal UI",
@@ -21,7 +20,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       >
         {children}
         {/* 🟢 Collapsible floating chat widget */}
-        <ChatWidget />
       </body>
     </html>
   );

@@ -24,7 +24,7 @@
     "string-similarity": "^4.0.4",
     "tsx": "^4.20.6",
     "undici": "^7.16.0",
-    "vercel": "^48.10.5",
+    "vercel": "^48.10.11",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

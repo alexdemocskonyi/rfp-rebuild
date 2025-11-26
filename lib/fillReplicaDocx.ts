@@ -1,3 +1,5 @@
+// lib/fillReplicaDocx.ts
+
 import { Document, Packer, Paragraph, TextRun } from "docx";
 import type { QAItem } from "@/app/api/generate-report/route";
 

@@ -1,3 +1,4 @@
+// app/api/generate-report/route.ts
 /**
  * app/api/generate-report/route.ts
  * - No name redaction in outputs
@@ -14,7 +15,7 @@ import * as XLSX from "xlsx";
 
 import { parseUnified } from "@/lib/unifiedParser";
 import { getEmbedding } from "@/lib/embed";
-import { retrieveMatches } from "@/lib/kb";
+import { retrieveMatchesWithContext } from "@/lib/kb";
 
 import { buildAnalystDocx } from "@/lib/buildAnalystDocx";
 import { buildSimpleDocx } from "@/lib/buildSimpleDocx";
@@ -101,11 +102,12 @@ export type QAItem = {
   sourcesUsed: string[];
   contextualMatches: MatchItem[];
   rawTextMatches: MatchItem[];
+  // NEW: raw context chunks (contracts, SOWs, policies, etc.)
+  contextChunks?: MatchItem[];
 };
 
 /* ---------------------------------------------------------------------------
    XLSX replica helper
-   Edit original workbook and add answers
 --------------------------------------------------------------------------- */
 
 /**
@@ -235,9 +237,6 @@ function buildReplicaWorkbookFromOriginalXlsx(
 
 /* ---------------------------------------------------------------------------
    DOCX replica helper (Option B)
-   Edit original DOCX document.xml in place and insert answers after questions,
-   cloning the paragraph properties (w:pPr) from the question paragraph so
-   formatting stays as close to the original as possible.
 --------------------------------------------------------------------------- */
 
 function escapeXml(text: string): string {
@@ -383,11 +382,29 @@ export async function POST(req: NextRequest) {
       if (qRaw.length === 0) continue;
 
       const emb = await getEmbedding(qRaw);
-      const matches = await retrieveMatches(emb, TOP_K, qRaw);
 
-      const good = (matches || []).filter(
-        (m: any) => m.score >= MIN_SCORE && m.answer
+      // NEW: retrieve QA matches + context chunks
+      const { qaMatches, contextMatches } = await retrieveMatchesWithContext(
+        emb,
+        TOP_K,
+        5,
+        qRaw
       );
+
+      const matches = qaMatches || [];
+
+      // strict first, then fallback like chat route
+      let good = matches.filter(
+        (m: any) => (m.score ?? 0) >= MIN_SCORE && m.answer
+      );
+
+      if (good.length === 0 && matches && matches.length > 0) {
+        console.log(
+          "[REPORT] No matches >= MIN_SCORE; falling back to top matches for question:",
+          qRaw
+        );
+        good = matches.filter((m: any) => m.answer);
+      }
 
       const seen = new Set<string>();
       const deduped: any[] = [];
@@ -401,59 +418,101 @@ export async function POST(req: NextRequest) {
         deduped.push(m);
       }
 
+      // Build candidate block: QA answers + context excerpts
+      let qaBlock = "(none)";
+      if (deduped.length > 0) {
+        qaBlock = deduped
+          .map(
+            (m, idx) =>
+              "[KB Answer " +
+              String(idx + 1) +
+              "] (source: " +
+              norm(m.source || m.origin || "Unknown source") +
+              ")\n" +
+              normalizeVendorNames(norm(m.answer))
+          )
+          .join("\n\n");
+      }
+
+      let contextBlock = "";
+      const ctxSlices = (contextMatches || []).slice(0, 5);
+      if (ctxSlices.length > 0) {
+        contextBlock =
+          "Relevant contract/context excerpts:\n\n" +
+          ctxSlices
+            .map(
+              (c, idx) =>
+                "[Context " +
+                String(idx + 1) +
+                "] (source: " +
+                norm(c.source || c.origin || "Unknown source") +
+                ")\n" +
+                safeSnippet(c.content || c.answer || c.question || "")
+            )
+            .join("\n\n");
+      }
+
+      const pieces: string[] = [];
+      pieces.push("KB Q/A answers:\n\n" + qaBlock);
+      if (contextBlock) {
+        pieces.push(contextBlock);
+      }
+
       const candidateBlock =
-        deduped.length > 0
-          ? deduped
-              .map(
-                (m, idx) =>
-                  "[Answer " +
-                  String(idx + 1) +
-                  "]\n" +
-                  normalizeVendorNames(norm(m.answer))
-              )
-              .join("\n\n")
-          : "(none)";
+        pieces.length > 0 ? pieces.join("\n\n--------------------\n\n") : "(none)";
 
       const prompt = [
         "You are an expert RFP analyst for Uprise Health.",
-        "Use only facts from the candidate answers.",
-        "Normalize legacy vendor names.",
-        "If nothing applies, respond exactly: Information not found in KB.",
+        "",
+        "You have two kinds of reference material:",
+        '- "KB Q/A answers": reusable answer text from Uprise’s internal knowledge base.',
+        '- "Relevant contract/context excerpts": snippets taken directly from sample contracts, policies, SOWs, and other uploaded reference documents.',
+        "",
+        "Use ONLY the information in these references.",
+        "If both KB answers and contract/context excerpts are relevant, synthesize them together into a single coherent answer.",
+        "Normalize legacy vendor names so that all entities are referred to as 'Uprise Health' where appropriate.",
+        "",
+        'If there is truly no relevant information at all, respond exactly: Information not found in KB.',
         "",
         "Question:",
         qRaw,
         "",
-        "Candidate answers:",
+        "Reference material:",
         candidateBlock,
       ].join("\n");
 
       let aiAnswer = "Information not found in KB.";
 
       try {
-        const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            authorization: "Bearer " + OPENAI_KEY,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
-            model: MODEL,
-            messages: [{ role: "user", content: prompt }],
-            temperature: 0.25,
-          }),
-        });
+        if (deduped.length > 0 || ctxSlices.length > 0) {
+          const resp = await fetch(
+            "https://api.openai.com/v1/chat/completions",
+            {
+              method: "POST",
+              headers: {
+                authorization: "Bearer " + OPENAI_KEY,
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({
+                model: MODEL,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.25,
+              }),
+            }
+          );
 
-        const data = await resp.json();
-        const modelAnswer =
-          data &&
-          Array.isArray(data.choices) &&
-          data.choices[0] &&
-          data.choices[0].message &&
-          typeof data.choices[0].message.content === "string"
-            ? data.choices[0].message.content.trim()
-            : "";
-        if (modelAnswer.length > 0) {
-          aiAnswer = normalizeVendorNames(modelAnswer);
+          const data = await resp.json();
+          const modelAnswer =
+            data &&
+            Array.isArray(data.choices) &&
+            data.choices[0] &&
+            data.choices[0].message &&
+            typeof data.choices[0].message.content === "string"
+              ? data.choices[0].message.content.trim()
+              : "";
+          if (modelAnswer.length > 0) {
+            aiAnswer = normalizeVendorNames(modelAnswer);
+          }
         }
       } catch (err) {
         console.error("GPT error:", err);
@@ -501,12 +560,27 @@ export async function POST(req: NextRequest) {
         }
       }
 
+      const contextChunks: MatchItem[] = (ctxSlices || []).map((c) => ({
+        source: c.source || c.origin || "Unknown source",
+        snippet: safeSnippet(c.content || c.answer || c.question || ""),
+      }));
+
+      const sourcesUsedSet = new Set<string>();
+
+      for (const m of deduped) {
+        sourcesUsedSet.add(norm(m.source || m.origin || "Unknown source"));
+      }
+      for (const c of ctxSlices) {
+        sourcesUsedSet.add(norm(c.source || c.origin || "Unknown source"));
+      }
+
       items.push({
         question: qRaw,
         aiAnswer,
-        sourcesUsed: deduped.map((m) => norm(m.source || "Unknown source")),
+        sourcesUsed: Array.from(sourcesUsedSet),
         contextualMatches: contextual,
         rawTextMatches: rawText,
+        contextChunks,
       });
     }
 

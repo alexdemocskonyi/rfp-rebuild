@@ -1,3 +1,5 @@
+// lib/report.ts
+
 import OpenAI from "openai";
 import { getEmbedding } from "@/lib/embed";
 import { retrieveMatches } from "@/lib/kb";

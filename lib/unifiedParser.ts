@@ -12,25 +12,29 @@ export type QAPair = {
 };
 
 const Q_HEADER_REGEX = /(question|prompt|rfp\s*item|inquiry|ask)/i;
-const A_HEADER_REGEX = /(answer|response|reply|details|description|explanation)/i;
+const A_HEADER_REGEX =
+  /(answer|response|reply|details|description|explanation|ai\s*answer)/i;
+// Explicit SOURCE-like headers for spreadsheets
+const SOURCE_HEADER_REGEX = /(source|origin|reference|ref)/i;
 
 function norm(s: any) {
   return (s ?? "").toString().replace(/\s+/g, " ").trim();
 }
 
 function isBadAnswer(a: string) {
+  const t = norm(a);
   return (
-    !a ||
-    a === "." ||
-    a === "-" ||
-    /^["']?[A-Za-z]?\W*$/.test(a) ||
-    a.match(/^\(?\s*200 words\s*\)?$/i) !== null
+    !t ||
+    t === "." ||
+    t === "-" ||
+    /^["']?[A-Za-z]?\W*$/.test(t) ||
+    /^\(?\s*200 words\s*\)?$/i.test(t)
   );
 }
 
 function redact(a: string) {
   return norm(a)
-    // strip Dr. First Last
+    // strip "Dr. First Last"
     .replace(/Dr\.\s+[A-Z][a-z]+\s+[A-Z][a-z]+/g, "")
     // SOC2 wording normalization
     .replace(
@@ -41,10 +45,7 @@ function redact(a: string) {
     .replace(/\b[\w.-]+@[\w.-]+\.\w+\b/g, "")
     // bad legacy location noise
     .replace(/juniper\s+florida/gi, "")
-    .replace(
-      /2\s+Park\s+Plaza\s+Suite\s+1200\s+Irvine\s+CA\s+92614/gi,
-      ""
-    )
+    .replace(/2\s+Park\s+Plaza\s+Suite\s+1200\s+Irvine\s+CA\s+92614/gi, "")
     .trim();
 }
 
@@ -74,40 +75,121 @@ function looksLikeQuestionLine(line: string): boolean {
   const t = norm(line);
   if (!t) return false;
 
-  // plain question
   if (t.endsWith("?")) return true;
 
-  // numbered items: "1. Text", "2) Text", "10) Text"
   if (/^\d+\s*[\.\)]\s+/.test(t)) return true;
 
-  // "Question 1:" / "Q1:" / "Question:"
   if (/^(question|q)\s*\d*\s*[:.)]\s*/i.test(t)) return true;
 
   return false;
 }
 
+/**
+ * Fallback for contracts / context docs:
+ * Turn raw text into reusable context chunks stored as Q/A pairs.
+ * - question: "Context from <src> (section N) – <snippet>"
+ * - answer: the full chunk text
+ */
+function extractContextChunksFromText(text: string, src: string): QAPair[] {
+  const cleaned = norm(text);
+  if (!cleaned) {
+    console.log("[PARSER] Context fallback: no text for", src);
+    return [];
+  }
+
+  const maxChunkChars = 1200;
+  const minChunkChars = 200;
+
+  const paragraphs = cleaned
+    .split(/\n{2,}/)
+    .map((p) => norm(p))
+    .filter((p) => p.length >= minChunkChars);
+
+  if (!paragraphs.length) {
+    console.log(
+      "[PARSER] Context fallback: 0 paragraphs >=",
+      minChunkChars,
+      "chars for",
+      src
+    );
+  }
+
+  const out: QAPair[] = [];
+  let section = 1;
+
+  for (const para of paragraphs) {
+    for (let i = 0; i < para.length; i += maxChunkChars) {
+      const chunk = para.slice(i, i + maxChunkChars).trim();
+      if (!chunk) continue;
+      if (chunk.length < minChunkChars && paragraphs.length > 1) continue;
+
+      let end = chunk.search(/[.?!]\s/);
+      if (end === -1 || end > 220) end = Math.min(220, chunk.length);
+      let snippet = chunk.slice(0, end + 1).trim();
+      if (snippet.length > 240) {
+        snippet = snippet.slice(0, 237) + "…";
+      }
+
+      const question = `Context from ${src} (section ${section}) – ${snippet}`;
+
+      out.push({
+        question,
+        answer: chunk,
+        source: src,
+      });
+
+      section += 1;
+    }
+  }
+
+  console.log(
+    "[PARSER] Context fallback produced",
+    out.length,
+    "chunks for",
+    src
+  );
+
+  return out;
+}
+
 function extractFromRows(rows: Record<string, any>[], src: string): QAPair[] {
   const out: QAPair[] = [];
+
   for (const r of rows) {
     const keys = Object.keys(r);
     if (!keys.length) continue;
 
-    const qKey =
-      keys.find((k) => Q_HEADER_REGEX.test(k)) ?? keys[0];
+    const qKey = keys.find((k) => Q_HEADER_REGEX.test(k)) ?? keys[0];
+
     const aKey =
-      keys.find((k) => A_HEADER_REGEX.test(k)) ?? keys[1];
+      keys.find((k) => A_HEADER_REGEX.test(k)) ??
+      (keys.length > 1 ? keys[1] : undefined);
+
+    // Look for a SOURCE-style column
+    const sKey = keys.find((k) => SOURCE_HEADER_REGEX.test(k));
 
     const q = norm(r[qKey]);
-    let a = norm(aKey != null ? r[aKey] : "");
+    const aRaw = aKey != null ? norm(r[aKey]) : "";
+    const srcCell = sKey != null ? norm(r[sKey]) : "";
 
     if (!q) continue;
 
-    const pair: QAPair = { question: q, answer: "", source: src };
-    if (!isBadAnswer(a)) pair.answer = redact(a);
+    let answer = "";
+    if (!isBadAnswer(aRaw)) {
+      answer = redact(aRaw);
+    }
+
+    const pair: QAPair = {
+      question: q,
+      answer,
+      source: srcCell || src,
+    };
+
     if (isFileReq(q)) pair.isFileRequest = true;
 
     out.push(pair);
   }
+
   return out;
 }
 
@@ -134,12 +216,13 @@ function extractPairsFromXLSX(buf: Buffer, src: string): QAPair[] {
   return dedupe(all);
 }
 
-async function extractFromDOCX(
-  buf: Buffer,
-  src: string
-): Promise<QAPair[]> {
+async function extractFromDOCX(buf: Buffer, src: string): Promise<QAPair[]> {
+  console.log("[PARSER] DOCX path for", src, "buf bytes", buf.byteLength);
   const res = await mammoth.extractRawText({ buffer: buf });
-  const lines = res.value
+  const text = res.value || "";
+  console.log("[PARSER] DOCX extracted chars", text.length, "for", src);
+
+  const lines = text
     .split(/\r?\n+/)
     .map(norm)
     .filter(Boolean);
@@ -151,20 +234,32 @@ async function extractFromDOCX(
     if (!looksLikeQuestionLine(line)) continue;
 
     const next = lines[i + 1] ?? "";
+    const aRaw = norm(next);
+    if (isBadAnswer(aRaw)) continue;
+
     out.push({
       question: line,
-      answer: redact(next),
+      answer: redact(aRaw),
       source: src,
       isFileRequest: isFileReq(line),
     });
   }
 
+  if (out.length === 0) {
+    console.log(
+      "[PARSER] DOCX produced 0 Q/A pairs; using context fallback for",
+      src
+    );
+    return extractContextChunksFromText(text, src);
+  }
+
+  console.log("[PARSER] DOCX produced", out.length, "Q/A pairs for", src);
   return dedupe(out);
 }
 
 function extractFromTXT(buf: Buffer, src: string): QAPair[] {
-  const lines = buf
-    .toString("utf8")
+  const text = buf.toString("utf8");
+  const lines = text
     .split(/\r?\n+/)
     .map(norm)
     .filter(Boolean);
@@ -176,6 +271,9 @@ function extractFromTXT(buf: Buffer, src: string): QAPair[] {
     if (!looksLikeQuestionLine(line)) continue;
 
     const next = lines[i + 1] ?? "";
+    const aRaw = norm(next);
+    if (isBadAnswer(aRaw)) continue;
+
     out.push({
       question: line,
       answer: redact(next),
@@ -184,16 +282,23 @@ function extractFromTXT(buf: Buffer, src: string): QAPair[] {
     });
   }
 
+  if (out.length === 0) {
+    console.log("[PARSER] TXT produced 0 Q/A pairs; using context fallback for", src);
+    return extractContextChunksFromText(text, src);
+  }
+
+  console.log("[PARSER] TXT produced", out.length, "Q/A pairs for", src);
   return dedupe(out);
 }
 
-async function extractFromPDF(
-  buf: Buffer,
-  src: string
-): Promise<QAPair[]> {
+async function extractFromPDF(buf: Buffer, src: string): Promise<QAPair[]> {
+  console.log("[PARSER] PDF path for", src, "buf bytes", buf.byteLength);
   try {
     const data = await pdf(buf);
-    const lines = norm(data.text)
+    const text = norm(data.text);
+    console.log("[PARSER] PDF extracted chars", text.length, "for", src);
+
+    const lines = text
       .split(/\r?\n+/)
       .map(norm)
       .filter(Boolean);
@@ -205,16 +310,29 @@ async function extractFromPDF(
       if (!looksLikeQuestionLine(line)) continue;
 
       const next = lines[i + 1] ?? "";
+      const aRaw = norm(next);
+      if (isBadAnswer(aRaw)) continue;
+
       out.push({
         question: line,
-        answer: redact(next),
+        answer: redact(aRaw),
         source: src,
         isFileRequest: isFileReq(line),
       });
     }
 
+    if (out.length === 0) {
+      console.log(
+        "[PARSER] PDF produced 0 Q/A pairs; using context fallback for",
+        src
+      );
+      return extractContextChunksFromText(text, src);
+    }
+
+    console.log("[PARSER] PDF produced", out.length, "Q/A pairs for", src);
     return dedupe(out);
-  } catch {
+  } catch (err) {
+    console.error("[PARSER] PDF error for", src, err);
     return [];
   }
 }
@@ -225,10 +343,10 @@ export async function parseUnified(
 ): Promise<QAPair[]> {
   const lower = filename.toLowerCase();
   const src = filename.replace(/\.[^.]+$/, "");
+  console.log("[PARSER] parseUnified for", filename);
 
   if (lower.endsWith(".csv")) return extractPairsFromCSV(buf, src);
-  if (/\.(xlsx|xlsm|xls)$/i.test(lower))
-    return extractPairsFromXLSX(buf, src);
+  if (/\.(xlsx|xlsm|xls)$/i.test(lower)) return extractPairsFromXLSX(buf, src);
   if (lower.endsWith(".docx")) return await extractFromDOCX(buf, src);
   if (lower.endsWith(".pdf")) return await extractFromPDF(buf, src);
 
